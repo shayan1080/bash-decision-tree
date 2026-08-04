@@ -181,11 +181,26 @@ def find_top_level_ifs(root, source: bytes, known_functions: set) -> list:
     return found
 
 
+def _condition_by_position(node):
+    """Fallback for when child_by_field_name('condition') returns None --
+    find the anonymous 'then' token and take the named child immediately
+    before it. Used because elif_clause doesn't expose 'condition' as a
+    field the way if_statement does."""
+    children = node.children
+    then_idx = next((i for i, c in enumerate(children) if c.type == "then"), None)
+    if then_idx is None:
+        return None
+    named_before = [c for c in children[:then_idx] if c.is_named]
+    return named_before[-1] if named_before else None
+
+
 def build_if_node(if_node, source: bytes, known_functions: set) -> dict:
     """Uses tree-sitter-bash's `condition` field directly (robust across
     simple commands, redirected commands, lists/pipelines, test
     expressions, etc.) rather than scanning for 'if'/'then' tokens."""
     condition_node = if_node.child_by_field_name("condition")
+    if condition_node is None:
+        condition_node = _condition_by_position(if_node)
     condition = classify_condition(condition_node, source, known_functions) if condition_node else None
 
     then_nodes = []
@@ -214,6 +229,8 @@ def build_if_node(if_node, source: bytes, known_functions: set) -> dict:
 
 def build_elif_node(elif_node, source: bytes, known_functions: set) -> dict:
     condition_node = elif_node.child_by_field_name("condition")
+    if condition_node is None:
+        condition_node = _condition_by_position(elif_node)
     condition = classify_condition(condition_node, source, known_functions) if condition_node else None
     body_nodes = [
         c for c in elif_node.named_children

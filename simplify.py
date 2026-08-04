@@ -45,7 +45,7 @@ def _expand_call(fname: str, functions: dict, visited: frozenset):
         return f"{fname}()  [not defined in the analyzed files]"
 
     if func.get("nested_ifs"):
-        node = _simplify_if(func["nested_ifs"][0], functions, visited | {fname})
+        node = _simplify_sequence(func["nested_ifs"], functions, visited | {fname})
         node["function"] = fname
         node["defined_in"] = func.get("defined_in")
         return node
@@ -60,6 +60,21 @@ def _expand_call(fname: str, functions: dict, visited: frozenset):
     }
 
 
+def _simplify_sequence(nested_ifs: list, functions: dict, visited: frozenset) -> dict:
+    """A body can contain more than one sibling if-statement in sequence
+    (e.g. a guard clause followed by another check). If the first one has
+    no else (so execution falls through when its condition is false),
+    chain the next if onto its "no" branch instead of dropping it.
+    This does not do full control-flow analysis (e.g. it won't notice a
+    `return` inside the yes-branch) - it only handles the common
+    guard-clause shape."""
+    first, *rest = nested_ifs
+    node = _simplify_if(first, functions, visited)
+    if node.get("no") is None and rest:
+        node["no"] = _simplify_sequence(rest, functions, visited)
+    return node
+
+
 def _simplify_branch(body, functions: dict, visited: frozenset):
     if body is None:
         return None
@@ -67,9 +82,10 @@ def _simplify_branch(body, functions: dict, visited: frozenset):
     actions = body.get("actions", [])
     nested_ifs = body.get("nested_ifs", [])
 
-    # A direct nested if/else inside this branch -> that's the continuation.
+    # Direct nested if/else statement(s) inside this branch -> that's the
+    # continuation (chain them if there's more than one in sequence).
     if nested_ifs:
-        return _simplify_if(nested_ifs[0], functions, visited)
+        return _simplify_sequence(nested_ifs, functions, visited)
 
     # A single action that's a call to a function which itself branches
     # -> inline-expand it (the case in your diagram: install_packages()).
