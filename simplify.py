@@ -81,22 +81,37 @@ def _simplify_branch(body, functions: dict, visited: frozenset):
 
     actions = body.get("actions", [])
     nested_ifs = body.get("nested_ifs", [])
+    leading = [_clean_label(a["text"]) for a in actions]  # any actions in this same body
 
     # Direct nested if/else statement(s) inside this branch -> that's the
     # continuation (chain them if there's more than one in sequence).
+    # Any plain actions that came before it in the same body are kept as
+    # "before" context on the resulting node.
     if nested_ifs:
-        return _simplify_sequence(nested_ifs, functions, visited)
+        node = _simplify_sequence(nested_ifs, functions, visited)
+        if leading and isinstance(node, dict):
+            node["before"] = leading
+        return node
 
-    # A single action that's a call to a function which itself branches
-    # -> inline-expand it (the case in your diagram: install_packages()).
-    if len(actions) == 1 and actions[0]["type"] == "call":
-        return _expand_call(actions[0]["function"], functions, visited)
+    # The LAST action is a call to a function that itself branches ->
+    # inline-expand it (e.g. `echo "..."; run_deploy`). Earlier actions in
+    # the same branch are kept as "before" context on the expanded node.
+    if actions and actions[-1]["type"] == "call":
+        expanded = _expand_call(actions[-1]["function"], functions, visited)
+        leading_before_call = leading[:-1]
+        if leading_before_call:
+            if isinstance(expanded, dict):
+                expanded["before"] = leading_before_call
+            elif isinstance(expanded, str):
+                expanded = leading_before_call + [expanded]
+            elif isinstance(expanded, list):
+                expanded = leading_before_call + expanded
+        return expanded
 
     # Otherwise: plain terminal leaf/leaves.
-    labels = [_clean_label(a["text"]) for a in actions]
-    if not labels:
+    if not leading:
         return None
-    return labels[0] if len(labels) == 1 else labels
+    return leading[0] if len(leading) == 1 else leading
 
 
 def _elif_chain_to_if(elif_branches, else_branch):
