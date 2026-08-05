@@ -60,17 +60,28 @@ def _expand_call(fname: str, functions: dict, visited: frozenset):
     }
 
 
-def _simplify_sequence(nested_ifs: list, functions: dict, visited: frozenset) -> dict:
-    """A body can contain more than one sibling if-statement in sequence
-    (e.g. a guard clause followed by another check). If the first one has
-    no else (so execution falls through when its condition is false),
-    chain the next if onto its "no" branch instead of dropping it.
-    This does not do full control-flow analysis (e.g. it won't notice a
-    `return` inside the yes-branch) - it only handles the common
-    guard-clause shape."""
-    first, *rest = nested_ifs
-    node = _simplify_if(first, functions, visited)
-    if node.get("no") is None and rest:
+def _simplify_node(node: dict, functions: dict, visited: frozenset) -> dict:
+    """Dispatches to the right simplifier based on node shape: a
+    case_statement node has "branches", an if_statement node has
+    "condition"."""
+    if "branches" in node:
+        return _simplify_case(node, functions, visited)
+    return _simplify_if(node, functions, visited)
+
+
+def _simplify_sequence(nested_decisions: list, functions: dict, visited: frozenset) -> dict:
+    """A body can contain more than one sibling if/case decision in
+    sequence (e.g. a guard clause followed by another check). If the
+    first one is an if with no else (so execution falls through when its
+    condition is false), chain the next decision onto its "no" branch
+    instead of dropping it. This does not do full control-flow analysis
+    (e.g. it won't notice a `return` inside the yes-branch), and doesn't
+    chain anything after a case_statement (execution always continues
+    after a case regardless of which branch matched, which doesn't fit
+    the yes/no "no" slot) - it only handles the common guard-clause shape."""
+    first, *rest = nested_decisions
+    node = _simplify_node(first, functions, visited)
+    if "branches" not in node and node.get("no") is None and rest:
         node["no"] = _simplify_sequence(rest, functions, visited)
     return node
 
@@ -112,6 +123,20 @@ def _simplify_branch(body, functions: dict, visited: frozenset):
     if not leading:
         return None
     return leading[0] if len(leading) == 1 else leading
+
+
+def _simplify_case(node: dict, functions: dict, visited: frozenset) -> dict:
+    value = node.get("case_value")
+    result = {
+        "case_value": (f'{value["text"]}()' if value and value["type"] == "call" else (value["text"] if value else None)),
+        "branches": [
+            {"pattern": b["pattern"], "then": _simplify_branch(b.get("then"), functions, visited)}
+            for b in node.get("branches", [])
+        ],
+    }
+    if value and value["type"] == "call":
+        result["value_detail"] = _expand_call(value["function"], functions, visited)
+    return result
 
 
 def _elif_chain_to_if(elif_branches, else_branch):
@@ -160,5 +185,5 @@ def simplify_project(analysis: dict) -> dict:
         trees = info.get("decision_trees") or []
         if not trees:
             continue
-        out[filename] = [_simplify_if(t, functions, frozenset()) for t in trees]
+        out[filename] = [_simplify_node(t, functions, frozenset()) for t in trees]
     return out
