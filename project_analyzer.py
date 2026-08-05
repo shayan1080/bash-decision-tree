@@ -124,19 +124,46 @@ def classify_condition(condition_node, source: bytes, known_functions: set) -> d
 
 COMPOUND_TYPES = (
     "for_statement", "while_statement", "c_style_for_statement",
-    "case_statement", "subshell", "compound_statement", "do_group",
+    "subshell", "compound_statement", "do_group",
 )
+
+
+def build_case_node(case_node, source: bytes, known_functions: set) -> dict:
+    """A case_statement becomes its own decision-node shape (distinct from
+    an if_statement's condition/yes/no): {"case_value":..., "branches":[...]}
+    with one branch per case_item, each holding that pattern's own body
+    (which itself can contain further nested ifs/cases)."""
+    value_node = case_node.child_by_field_name("value")
+    value = classify_condition(value_node, source, known_functions) if value_node else None
+
+    branches = []
+    for item in case_node.named_children:
+        if item.type != "case_item":
+            continue
+        pattern_node = item.child_by_field_name("value")
+        pattern_text = node_text(pattern_node, source) if pattern_node else "*"
+        body_nodes = [c for c in item.named_children if c != pattern_node and c.type != "comment"]
+        branches.append({"pattern": pattern_text, "then": build_body(body_nodes, source, known_functions)})
+
+    return {
+        "case_value": value,
+        "line": case_node.start_point[0] + 1,
+        "branches": branches,
+    }
 
 
 def build_body(statement_nodes, source: bytes, known_functions: set) -> dict:
     """Build the {"actions": [...], "nested_ifs": [...]} shape for a
-    then/elif/else body or a function body."""
+    then/elif/else body or a function body. "nested_ifs" holds both
+    if_statement and case_statement decision nodes found directly here."""
     actions = []
     nested_ifs = []
 
     for node in statement_nodes:
         if node.type == "if_statement":
             nested_ifs.append(build_if_node(node, source, known_functions))
+        elif node.type == "case_statement":
+            nested_ifs.append(build_case_node(node, source, known_functions))
         elif node.type == "command":
             action = classify_command(node, source, known_functions)
             if action["type"] != "source":  # source lines are dependency info, not actions
@@ -155,12 +182,15 @@ def build_body(statement_nodes, source: bytes, known_functions: set) -> dict:
 
 
 def find_nested_ifs(node, source: bytes, known_functions: set) -> list:
-    """Recursively find if_statements inside for/while/case/subshell bodies,
-    without crossing into a nested function_definition."""
+    """Recursively find if_statement/case_statement decision nodes inside
+    for/while/subshell bodies, without crossing into a nested
+    function_definition."""
     found = []
     for child in node.named_children:
         if child.type == "if_statement":
             found.append(build_if_node(child, source, known_functions))
+        elif child.type == "case_statement":
+            found.append(build_case_node(child, source, known_functions))
         elif child.type == "function_definition":
             continue
         else:
@@ -169,11 +199,14 @@ def find_nested_ifs(node, source: bytes, known_functions: set) -> list:
 
 
 def find_top_level_ifs(root, source: bytes, known_functions: set) -> list:
-    """Find if_statements at the top level of a file (outside any function)."""
+    """Find if_statement/case_statement decision nodes at the top level of
+    a file (outside any function)."""
     found = []
     for child in root.named_children:
         if child.type == "if_statement":
             found.append(build_if_node(child, source, known_functions))
+        elif child.type == "case_statement":
+            found.append(build_case_node(child, source, known_functions))
         elif child.type == "function_definition":
             continue
         else:
