@@ -87,9 +87,9 @@ DETAIL_MAX_CHARS = 45  # keep folded (2nd-level+) detail summaries short
 
 
 def _summarize(detail):
-    """Flatten a condition_detail (or leaf, or no-branch function call)
-    into one short line. Used only for a detail-of-a-detail, which is
-    folded into subtitle text instead of being drawn as its own
+    """Flatten a condition_detail (or leaf, or no-branch function call, or
+    case node) into one short line. Used only for a detail-of-a-detail,
+    which is folded into subtitle text instead of being drawn as its own
     sub-tree (see build_tree) -- stacking two upward-growing subtrees
     would otherwise collide."""
     if detail is None:
@@ -98,6 +98,9 @@ def _summarize(detail):
         return detail
     if isinstance(detail, list):
         return " / ".join(str(v) for v in detail)
+    if "branches" in detail:
+        parts = ", ".join(b["pattern"] for b in detail.get("branches", []))
+        return f'case {detail.get("case_value")}: {parts}'
     if "condition" in detail:
         yes, no = detail.get("yes"), detail.get("no")
         yes_s = yes if isinstance(yes, str) else ("..." if yes else "-")
@@ -111,6 +114,10 @@ def _summarize(detail):
 def build_tree(node, dashed=False, in_detail=False):
     if not isinstance(node, dict):
         return TreeNode(Box(leaf_text(node), kind="leaf", dashed=dashed))
+
+    # A case_statement node: {"case_value":..., "branches":[{"pattern":..., "then":...}], [value_detail]}
+    if "branches" in node:
+        return _build_case_tree(node, dashed, in_detail)
 
     # A function with no internal branching: {"function":..., "actions":[...]}
     if "actions" in node and "condition" not in node:
@@ -150,6 +157,32 @@ def build_tree(node, dashed=False, in_detail=False):
     tn = TreeNode(box)
     tn.children.append(("no", build_tree(node.get("no"), dashed, in_detail)))
     tn.children.append(("yes", build_tree(node.get("yes"), dashed, in_detail)))
+    tn.detail = nested_detail_tree
+    return tn
+
+
+def _build_case_tree(node, dashed, in_detail):
+    value = node.get("case_value")
+    title = f"case {value}" if value else "case"
+    subtitle = None
+
+    value_detail = node.get("value_detail")
+    nested_detail_tree = None
+    if value_detail is not None:
+        if not in_detail:
+            nested_detail_tree = build_tree(value_detail, dashed=True, in_detail=True)
+        else:
+            summary = _summarize(value_detail)
+            if summary:
+                if len(summary) > DETAIL_MAX_CHARS:
+                    summary = summary[: DETAIL_MAX_CHARS - 3] + "..."
+                subtitle = f"detail: {summary}"
+
+    box = Box(title, subtitle, kind="decision", dashed=dashed)
+    tn = TreeNode(box)
+    for branch in node.get("branches", []):
+        child = build_tree(branch.get("then"), dashed, in_detail)
+        tn.children.append((branch["pattern"], child))
     tn.detail = nested_detail_tree
     return tn
 
