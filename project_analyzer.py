@@ -103,19 +103,26 @@ def classify_command(node, source: bytes, known_functions: set) -> dict:
 
 def classify_condition(condition_node, source: bytes, known_functions: set) -> dict:
     """Classify an if/elif condition (the node under the `condition` field).
-    If it's a single bare command whose name matches a known function,
-    mark it as a call (this is the `if check_network; then` case).
+    If it's a single bare command (optionally negated with `!`) whose name
+    matches a known function, mark it as a call (this covers both
+    `if check_network; then` and the very common `if ! check_network; then`
+    guard-clause pattern -- negation wraps the command in a
+    negated_command node, so we unwrap it before checking).
     Compound conditions (lists, pipelines, redirected commands, test
     expressions, etc.) are kept as raw text -- they aren't a plain call."""
-    if condition_node.type == "command":
-        name_node = condition_node.child_by_field_name("name")
-        name_text = node_text(name_node, source) if name_node else None
-        text = node_text(condition_node, source)
-        if name_text in known_functions:
-            return {"text": text, "type": "call", "function": name_text}
-        return {"text": text, "type": "raw"}
+    full_text = node_text(condition_node, source)
+    target = condition_node
+    if condition_node.type == "negated_command" and condition_node.named_children:
+        target = condition_node.named_children[0]
 
-    return {"text": node_text(condition_node, source), "type": "raw"}
+    if target.type == "command":
+        name_node = target.child_by_field_name("name")
+        name_text = node_text(name_node, source) if name_node else None
+        if name_text in known_functions:
+            return {"text": full_text, "type": "call", "function": name_text}
+        return {"text": full_text, "type": "raw"}
+
+    return {"text": full_text, "type": "raw"}
 
 
 # ---------------------------------------------------------------------------
@@ -157,32 +164,45 @@ def build_case_node(case_node, source: bytes, known_functions: set) -> dict:
 
 
 def build_body(statement_nodes, source: bytes, known_functions: set) -> dict:
-    """Build the {"actions": [...], "nested_ifs": [...]} shape for a
-    then/elif/else body or a function body. "nested_ifs" holds both
-    if_statement and case_statement decision nodes found directly here."""
+    """Build the {"actions": [...], "nested_ifs": [...], "after_actions": [...]}
+    shape for a then/elif/else body or a function body. "nested_ifs" holds
+    both if_statement and case_statement decision nodes found directly
+    here. Actions are split into "actions" (occurring before the first
+    decision in this body) and "after_actions" (occurring after the last
+    one) -- e.g. a guard-clause chain followed by a final `return 0`. This
+    is an approximation: actions interleaved BETWEEN multiple decisions in
+    the same body all land in "after_actions" too, since we don't track a
+    full per-statement order, only before-vs-after the decision block."""
     actions = []
+    after_actions = []
     nested_ifs = []
+    seen_decision = False
 
     for node in statement_nodes:
         if node.type == "if_statement":
             nested_ifs.append(build_if_node(node, source, known_functions))
+            seen_decision = True
         elif node.type == "case_statement":
             nested_ifs.append(build_case_node(node, source, known_functions))
+            seen_decision = True
         elif node.type == "command":
             action = classify_command(node, source, known_functions)
             if action["type"] != "source":  # source lines are dependency info, not actions
-                actions.append(action)
+                (after_actions if seen_decision else actions).append(action)
         elif node.type == "function_definition":
             continue  # handled at the project level, not inline
         elif node.type in COMPOUND_TYPES:
-            nested_ifs.extend(find_nested_ifs(node, source, known_functions))
-            actions.append({"type": "block", "text": node_text(node, source)})
+            inner_ifs = find_nested_ifs(node, source, known_functions)
+            nested_ifs.extend(inner_ifs)
+            (after_actions if seen_decision else actions).append({"type": "block", "text": node_text(node, source)})
+            if inner_ifs:
+                seen_decision = True
         else:
             text = node_text(node, source)
             if text:
-                actions.append({"type": "other", "text": text})
+                (after_actions if seen_decision else actions).append({"type": "other", "text": text})
 
-    return {"actions": actions, "nested_ifs": nested_ifs}
+    return {"actions": actions, "nested_ifs": nested_ifs, "after_actions": after_actions}
 
 
 def find_nested_ifs(node, source: bytes, known_functions: set) -> list:
