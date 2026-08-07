@@ -140,9 +140,13 @@ def build_case_node(case_node, source: bytes, known_functions: set) -> dict:
     for item in case_node.named_children:
         if item.type != "case_item":
             continue
-        pattern_node = item.child_by_field_name("value")
-        pattern_text = node_text(pattern_node, source) if pattern_node else "*"
-        body_nodes = [c for c in item.named_children if c != pattern_node and c.type != "comment"]
+        # "value" is a repeated field: production|staging|development) gives
+        # THREE separate pattern nodes, not one. Using child_by_field_name
+        # (singular) here left the 2nd/3rd patterns unmatched, and they were
+        # then incorrectly swept into the body as if they were actions.
+        pattern_nodes = item.children_by_field_name("value")
+        pattern_text = "|".join(node_text(p, source) for p in pattern_nodes) if pattern_nodes else "*"
+        body_nodes = [c for c in item.named_children if c not in pattern_nodes and c.type != "comment"]
         branches.append({"pattern": pattern_text, "then": build_body(body_nodes, source, known_functions)})
 
     return {
@@ -326,7 +330,7 @@ def main():
     file_paths = []
     for p in args.paths:
         if p.is_dir():
-            file_paths.extend(sorted(p.glob("*.sh")))
+            file_paths.extend(sorted(p.rglob("*.sh")))
         else:
             file_paths.append(p)
 
