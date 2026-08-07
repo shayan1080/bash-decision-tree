@@ -46,6 +46,12 @@ def _expand_call(fname: str, functions: dict, visited: frozenset):
 
     if func.get("nested_ifs"):
         node = _simplify_sequence(func["nested_ifs"], functions, visited | {fname})
+        leading = [_clean_label(a["text"]) for a in func.get("actions", [])]
+        trailing = [_clean_label(a["text"]) for a in func.get("after_actions", [])]
+        if leading:
+            node["before"] = leading
+        if trailing:
+            node = _attach_trailing(node, trailing)
         node["function"] = fname
         node["defined_in"] = func.get("defined_in")
         return node
@@ -116,22 +122,47 @@ def _append_continuation(existing, continuation):
     return existing
 
 
+def _attach_trailing(node, trailing: list):
+    """Best-effort: append trailing actions (that came after all the
+    nested ifs/cases in a body) onto the natural fallthrough leaf(s) --
+    every case branch, or the deepest 'no' of an if/elif chain. Doesn't
+    attempt to reach every terminal leaf of a complex tree (e.g. it won't
+    notice a `return` inside a yes-branch means that branch shouldn't
+    receive the trailing actions) - same class of heuristic as the
+    guard-clause chaining above."""
+    if not trailing:
+        return node
+    if isinstance(node, dict) and "branches" in node:
+        for b in node["branches"]:
+            b["then"] = _attach_trailing(b["then"], trailing)
+        return node
+    if isinstance(node, dict) and "condition" in node:
+        node["no"] = _attach_trailing(node.get("no"), trailing)
+        return node
+    return _append_continuation(node, trailing)
+
+
 def _simplify_branch(body, functions: dict, visited: frozenset):
     if body is None:
         return None
 
     actions = body.get("actions", [])
     nested_ifs = body.get("nested_ifs", [])
-    leading = [_clean_label(a["text"]) for a in actions]  # any actions in this same body
+    after_actions = body.get("after_actions", [])
+    leading = [_clean_label(a["text"]) for a in actions]
+    trailing = [_clean_label(a["text"]) for a in after_actions]
 
     # Direct nested if/else statement(s) inside this branch -> that's the
     # continuation (chain them if there's more than one in sequence).
     # Any plain actions that came before it in the same body are kept as
-    # "before" context on the resulting node.
+    # "before" context; anything that came after is chained on as the
+    # natural fallthrough (e.g. a guard-clause chain ending in `return 0`).
     if nested_ifs:
         node = _simplify_sequence(nested_ifs, functions, visited)
         if leading and isinstance(node, dict):
             node["before"] = leading
+        if trailing:
+            node = _attach_trailing(node, trailing)
         return node
 
     # The LAST action is a call to a function that itself branches ->
