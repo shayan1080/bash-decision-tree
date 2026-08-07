@@ -71,19 +71,49 @@ def _simplify_node(node: dict, functions: dict, visited: frozenset) -> dict:
 
 def _simplify_sequence(nested_decisions: list, functions: dict, visited: frozenset) -> dict:
     """A body can contain more than one sibling if/case decision in
-    sequence (e.g. a guard clause followed by another check). If the
-    first one is an if with no else (so execution falls through when its
-    condition is false), chain the next decision onto its "no" branch
-    instead of dropping it. This does not do full control-flow analysis
-    (e.g. it won't notice a `return` inside the yes-branch), and doesn't
-    chain anything after a case_statement (execution always continues
-    after a case regardless of which branch matched, which doesn't fit
-    the yes/no "no" slot) - it only handles the common guard-clause shape."""
+    sequence (e.g. a guard clause followed by another check, or a
+    validation `case` followed by the real logic). This does not do full
+    control-flow analysis (e.g. it won't notice a `return`/`exit` inside a
+    branch, so a continuation may get attached after a branch that
+    actually terminates) - it only handles the common shapes:
+      - if with no else -> chain the rest onto its "no" branch.
+      - case_statement -> chain the rest onto the END of EVERY branch,
+        since execution continues after a case regardless of which
+        branch matched.
+    """
     first, *rest = nested_decisions
     node = _simplify_node(first, functions, visited)
-    if "branches" not in node and node.get("no") is None and rest:
-        node["no"] = _simplify_sequence(rest, functions, visited)
+    if not rest:
+        return node
+
+    continuation = _simplify_sequence(rest, functions, visited)
+    if "branches" in node:
+        for b in node["branches"]:
+            b["then"] = _append_continuation(b["then"], continuation)
+    elif node.get("no") is None:
+        node["no"] = continuation
     return node
+
+
+def _append_continuation(existing, continuation):
+    """Appends "whatever runs next" onto the end of an already-simplified
+    branch value. Handles the common shapes (empty branch, plain leaf
+    text) cleanly; if the branch is itself a further decision (nested
+    if/case), the continuation can't be cleanly spliced into all of ITS
+    leaves without deeper recursion, so it's left as-is in that case
+    (documented limitation)."""
+    if existing is None:
+        return continuation
+    if isinstance(existing, (str, list)):
+        existing_list = existing if isinstance(existing, list) else [existing]
+        if isinstance(continuation, dict):
+            result = dict(continuation)
+            result["before"] = existing_list + result.get("before", [])
+            return result
+        if isinstance(continuation, list):
+            return existing_list + continuation
+        return existing_list + [continuation]
+    return existing
 
 
 def _simplify_branch(body, functions: dict, visited: frozenset):
