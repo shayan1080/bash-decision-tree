@@ -22,6 +22,7 @@ No tree-sitter dependency here - this only works on already-parsed JSON,
 so it can be re-run on a saved output.json without touching bash at all.
 """
 
+import copy
 import re
 
 _ECHO_RE = re.compile(r'^echo\s+["\'](.*)["\']\s*$')
@@ -95,7 +96,7 @@ def _simplify_sequence(nested_decisions: list, functions: dict, visited: frozens
     continuation = _simplify_sequence(rest, functions, visited)
     if "branches" in node:
         for b in node["branches"]:
-            b["then"] = _append_continuation(b["then"], continuation)
+            b["then"] = _append_continuation(b["then"], copy.deepcopy(continuation))
     elif node.get("no") is None:
         node["no"] = continuation
     return node
@@ -107,15 +108,16 @@ def _append_continuation(existing, continuation):
     text) cleanly; if the branch is itself a further decision (nested
     if/case), the continuation can't be cleanly spliced into all of ITS
     leaves without deeper recursion, so it's left as-is in that case
-    (documented limitation)."""
+    (documented limitation). `continuation` is always a value this call
+    owns exclusively (deep-copied by the caller when reused across
+    branches), so mutating/embedding it directly here is safe."""
     if existing is None:
         return continuation
     if isinstance(existing, (str, list)):
         existing_list = existing if isinstance(existing, list) else [existing]
         if isinstance(continuation, dict):
-            result = dict(continuation)
-            result["before"] = existing_list + result.get("before", [])
-            return result
+            continuation["before"] = existing_list + continuation.get("before", [])
+            return continuation
         if isinstance(continuation, list):
             return existing_list + continuation
         return existing_list + [continuation]

@@ -179,6 +179,8 @@ def build_body(statement_nodes, source: bytes, known_functions: set) -> dict:
     seen_decision = False
 
     for node in statement_nodes:
+        if node.type == "comment":
+            continue
         if node.type == "if_statement":
             nested_ifs.append(build_if_node(node, source, known_functions))
             seen_decision = True
