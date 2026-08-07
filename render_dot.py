@@ -24,7 +24,7 @@ from pathlib import Path
 
 
 class DotBuilder:
-    def __init__(self, detailed=False):
+    def __init__(self, detailed=True):
         self.lines = [
             'digraph decision_tree {',
             'rankdir=TB;',
@@ -106,11 +106,20 @@ class DotBuilder:
         return nid
 
     def _visit_if(self, node):
-        """Visit an if_statement node."""
+        """Visit an if_statement node (which may also be a resolved function
+        call carrying function/defined_in/before, e.g. run_deploy())."""
         nid = self.fresh_id()
         condition = node.get("condition") or "?"
-        label = f"if {condition}"
-        self.add_node(nid, label, color="#e3f2fd")
+        label_lines = [f"if {condition}"]
+        if "function" in node:
+            label_lines.append(f'{node["function"]}() - {node.get("defined_in", "")}')
+        self.add_node(nid, "\n".join(label_lines), color="#e3f2fd")
+
+        # Leading actions that happen before this call/decision (e.g. an
+        # echo right before calling the function this node expands).
+        for action in node.get("before", []):
+            action_id = self.visit(action)
+            self.add_edge(nid, action_id, "before")
 
         # Condition detail (if present and detailed mode)
         if self.detailed and "condition_detail" in node:
@@ -158,7 +167,7 @@ class DotBuilder:
         return "\n".join(self.lines)
 
 
-def render_dot(tree_json, detailed=False):
+def render_dot(tree_json, detailed=True):
     """Convert a single decision-tree JSON to DOT format."""
     builder = DotBuilder(detailed=detailed)
     builder.visit(tree_json)
@@ -171,7 +180,8 @@ def main():
     )
     ap.add_argument("input", type=Path, help="Path to clean JSON (project_analyzer.py --clean output)")
     ap.add_argument("-o", "--outdir", type=Path, default=Path("tree_dots"))
-    ap.add_argument("--detailed", action="store_true", help="Include condition_detail/value_detail edges")
+    ap.add_argument("--simple", action="store_true",
+                     help="Omit condition_detail/value_detail edges (shown by default)")
     args = ap.parse_args()
 
     data = json.loads(args.input.read_text(encoding="utf-8"))
@@ -180,7 +190,7 @@ def main():
     count = 0
     for filename, trees in data.items():
         for i, tree in enumerate(trees):
-            dot = render_dot(tree, detailed=args.detailed)
+            dot = render_dot(tree, detailed=not args.simple)
             out_path = args.outdir / f"{Path(filename).stem}_{i + 1}.dot"
             out_path.write_text(dot, encoding="utf-8")
             print(f"Wrote {out_path}", file=sys.stderr)
