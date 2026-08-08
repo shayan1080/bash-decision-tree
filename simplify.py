@@ -191,12 +191,14 @@ def _simplify_branch(body, functions: dict, visited: frozenset):
 def _simplify_case(node: dict, functions: dict, visited: frozenset) -> dict:
     value = node.get("case_value")
     result = {
-        "case_value": (f'{value["text"]}()' if value and value["type"] == "call" else (value["text"] if value else None)),
+        "case_value": (f'{value["function"]}()' if value and value["type"] == "call" else (value["text"] if value else None)),
         "branches": [
             {"pattern": b["pattern"], "then": _simplify_branch(b.get("then"), functions, visited)}
             for b in node.get("branches", [])
         ],
     }
+    if "line" in node:
+        result["line"] = node["line"]
     if value and value["type"] == "call":
         result["value_detail"] = _expand_call(value["function"], functions, visited)
     return result
@@ -217,12 +219,14 @@ def _elif_chain_to_if(elif_branches, else_branch):
 def _simplify_if(if_node: dict, functions: dict, visited: frozenset) -> dict:
     condition = if_node.get("condition")
     node = {"condition": condition["text"] if condition else None}
+    if "line" in if_node:
+        node["line"] = if_node["line"]
 
     # If the condition itself is a call to a known function, don't throw
     # away its internal branching - attach it as a side-detail so nothing
     # is lost, while the outer yes/no keeps driving the actual flow.
     if condition and condition["type"] == "call":
-        node["condition"] = f'{condition["text"]}()'
+        node["condition"] = f'{condition["function"]}()'
         node["condition_detail"] = _expand_call(condition["function"], functions, visited)
 
     node["yes"] = _simplify_branch(if_node.get("then"), functions, visited)
