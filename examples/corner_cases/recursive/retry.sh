@@ -11,3 +11,9 @@ retry_download() {
         retry_download
     fi
 }
+
+if retry_download; then
+    echo "Done"
+else
+    echo "Gave up"
+fi

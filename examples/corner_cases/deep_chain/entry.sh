@@ -5,6 +5,7 @@
 # case the current code special-cases).
 
 source validate.sh
+source deploy_step.sh
 
 if validate_environment; then
     echo "Environment OK, starting deploy"
