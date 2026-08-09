@@ -26,6 +26,7 @@ import copy
 import re
 
 _ECHO_RE = re.compile(r'^echo\s+["\'](.*)["\']\s*$')
+_TERMINATOR_RE = re.compile(r'^(return|exit)\b')
 
 
 def _clean_label(text: str) -> str:
@@ -35,6 +36,22 @@ def _clean_label(text: str) -> str:
         return text
     m = _ECHO_RE.match(text.strip())
     return m.group(1) if m else text
+
+
+def _terminates(value) -> bool:
+    """True if a branch's visible content ends with a return/exit
+    statement, meaning execution doesn't fall through to whatever comes
+    next - so no further continuation should be chained onto it.
+    For a nested decision (if/case) or an expanded-call dict, whether
+    EVERY path through it terminates isn't tracked, so we conservatively
+    say no (better to over-attach a continuation than lose one)."""
+    if value is None:
+        return False
+    if isinstance(value, str):
+        return bool(_TERMINATOR_RE.match(value.strip()))
+    if isinstance(value, list):
+        return bool(value) and _terminates(value[-1])
+    return False
 
 
 def _expand_call(fname: str, functions: dict, visited: frozenset):
@@ -79,15 +96,14 @@ def _simplify_node(node: dict, functions: dict, visited: frozenset) -> dict:
 def _simplify_sequence(nested_decisions: list, functions: dict, visited: frozenset) -> dict:
     """A body can contain more than one sibling if/case decision in
     sequence (e.g. a guard clause followed by another check, or a
-    validation `case` followed by the real logic). This does not do full
-    control-flow analysis (e.g. it won't notice a `return`/`exit` inside a
-    branch, so a continuation may get attached after a branch that
-    actually terminates) - it only handles the common shapes:
-      - if with no else -> chain the rest onto its "no" branch.
-      - case_statement -> chain the rest onto the END of EVERY branch,
-        since execution continues after a case regardless of which
-        branch matched.
-    """
+    validation `case` followed by the real logic). Chains the rest onto
+    every branch that doesn't end in return/exit (see _terminates) -
+    if with no else -> its "no"; case_statement -> every branch; an
+    explicit else/branch that doesn't terminate also gets it, since
+    execution really does continue past it. This still isn't full
+    control-flow analysis (e.g. an early return buried inside a nested
+    if two levels down within a branch won't be noticed) - just the
+    common shapes."""
     first, *rest = nested_decisions
     node = _simplify_node(first, functions, visited)
     if not rest:
@@ -96,9 +112,13 @@ def _simplify_sequence(nested_decisions: list, functions: dict, visited: frozens
     continuation = _simplify_sequence(rest, functions, visited)
     if "branches" in node:
         for b in node["branches"]:
-            b["then"] = _append_continuation(b["then"], copy.deepcopy(continuation))
-    elif node.get("no") is None:
-        node["no"] = continuation
+            if not _terminates(b["then"]):
+                b["then"] = _append_continuation(b["then"], copy.deepcopy(continuation))
+    else:
+        if not _terminates(node.get("yes")):
+            node["yes"] = _append_continuation(node.get("yes"), copy.deepcopy(continuation))
+        if not _terminates(node.get("no")):
+            node["no"] = _append_continuation(node.get("no"), continuation)
     return node
 
 
@@ -126,19 +146,19 @@ def _append_continuation(existing, continuation):
 
 def _attach_trailing(node, trailing: list):
     """Best-effort: append trailing actions (that came after all the
-    nested ifs/cases in a body) onto the natural fallthrough leaf(s) --
-    every case branch, or the deepest 'no' of an if/elif chain. Doesn't
-    attempt to reach every terminal leaf of a complex tree (e.g. it won't
-    notice a `return` inside a yes-branch means that branch shouldn't
-    receive the trailing actions) - same class of heuristic as the
-    guard-clause chaining above."""
-    if not trailing:
+    nested ifs/cases in a body) onto every leaf that doesn't already
+    terminate with return/exit - every case branch, or the yes/no of an
+    if/elif chain. Still not full control-flow analysis (a return buried
+    two levels deep inside a branch won't be noticed), but a branch whose
+    OWN last visible action is return/exit is now correctly left alone."""
+    if not trailing or _terminates(node):
         return node
     if isinstance(node, dict) and "branches" in node:
         for b in node["branches"]:
             b["then"] = _attach_trailing(b["then"], trailing)
         return node
     if isinstance(node, dict) and "condition" in node:
+        node["yes"] = _attach_trailing(node.get("yes"), trailing)
         node["no"] = _attach_trailing(node.get("no"), trailing)
         return node
     return _append_continuation(node, trailing)
