@@ -24,7 +24,7 @@ from pathlib import Path
 
 
 class DotBuilder:
-    def __init__(self, detailed=True):
+    def __init__(self, detailed=True, show_before=False):
         self.lines = [
             'digraph decision_tree {',
             'rankdir=TB;',
@@ -33,6 +33,7 @@ class DotBuilder:
         ]
         self.node_id = 0
         self.detailed = detailed
+        self.show_before = show_before
 
     def fresh_id(self):
         nid = self.node_id
@@ -88,12 +89,10 @@ class DotBuilder:
         # A function call or other dict
         if "function" in node:
             nid = self.fresh_id()
-            label = f'{node["function"]}()\n{node.get("defined_in", "")}'
-            self.add_node(nid, label, color="#c8e6c9")
-            if "before" in node:
-                for action in node["before"]:
-                    action_id = self.visit(action)
-                    self.add_edge(nid, action_id, "before")
+            label_lines = [f'{node["function"]}()', node.get("defined_in", "")]
+            if self.show_before and node.get("before"):
+                label_lines.append("before: " + "; ".join(str(b) for b in node["before"]))
+            self.add_node(nid, "\n".join(label_lines), color="#c8e6c9")
             if "actions" in node:
                 for action in node["actions"]:
                     action_id = self.visit(action)
@@ -113,13 +112,9 @@ class DotBuilder:
         label_lines = [f"if {condition}"]
         if "function" in node:
             label_lines.append(f'{node["function"]}() - {node.get("defined_in", "")}')
+        if self.show_before and node.get("before"):
+            label_lines.append("before: " + "; ".join(str(b) for b in node["before"]))
         self.add_node(nid, "\n".join(label_lines), color="#e3f2fd")
-
-        # Leading actions that happen before this call/decision (e.g. an
-        # echo right before calling the function this node expands).
-        for action in node.get("before", []):
-            action_id = self.visit(action)
-            self.add_edge(nid, action_id, "before")
 
         # Condition detail (if present and detailed mode)
         if self.detailed and "condition_detail" in node:
@@ -143,8 +138,10 @@ class DotBuilder:
         """Visit a case_statement node."""
         nid = self.fresh_id()
         case_value = node.get("case_value") or "?"
-        label = f"case {case_value}"
-        self.add_node(nid, label, color="#fff3e0")
+        label_lines = [f"case {case_value}"]
+        if self.show_before and node.get("before"):
+            label_lines.append("before: " + "; ".join(str(b) for b in node["before"]))
+        self.add_node(nid, "\n".join(label_lines), color="#fff3e0")
 
         # Value detail (if present and detailed mode)
         if self.detailed and "value_detail" in node:
@@ -167,9 +164,9 @@ class DotBuilder:
         return "\n".join(self.lines)
 
 
-def render_dot(tree_json, detailed=True):
+def render_dot(tree_json, detailed=True, show_before=False):
     """Convert a single decision-tree JSON to DOT format."""
-    builder = DotBuilder(detailed=detailed)
+    builder = DotBuilder(detailed=detailed, show_before=show_before)
     builder.visit(tree_json)
     return builder.build()
 
@@ -182,6 +179,8 @@ def main():
     ap.add_argument("-o", "--outdir", type=Path, default=Path("tree_dots"))
     ap.add_argument("--simple", action="store_true",
                      help="Omit condition_detail/value_detail edges (shown by default)")
+    ap.add_argument("--show-before", action="store_true",
+                     help="Show 'before' actions inside the owning node's label (hidden by default)")
     args = ap.parse_args()
 
     data = json.loads(args.input.read_text(encoding="utf-8"))
@@ -190,7 +189,7 @@ def main():
     count = 0
     for filename, trees in data.items():
         for i, tree in enumerate(trees):
-            dot = render_dot(tree, detailed=not args.simple)
+            dot = render_dot(tree, detailed=not args.simple, show_before=args.show_before)
             out_path = args.outdir / f"{Path(filename).stem}_{i + 1}.dot"
             out_path.write_text(dot, encoding="utf-8")
             print(f"Wrote {out_path}", file=sys.stderr)
