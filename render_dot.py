@@ -24,7 +24,7 @@ from pathlib import Path
 
 
 class DotBuilder:
-    def __init__(self, detailed=True, show_before=False):
+    def __init__(self, detailed=True, show_before=False, max_depth=None):
         self.lines = [
             'digraph decision_tree {',
             'rankdir=TB;',
@@ -34,6 +34,7 @@ class DotBuilder:
         self.node_id = 0
         self.detailed = detailed
         self.show_before = show_before
+        self.max_depth = max_depth
 
     def fresh_id(self):
         nid = self.node_id
@@ -60,8 +61,14 @@ class DotBuilder:
         else:
             self.lines.append(f'n{from_id} -> n{to_id};')
 
-    def visit(self, node):
-        """Recursively visit and build DOT for a node. Returns its node ID."""
+    def visit(self, node, depth=0):
+        """Recursively visit and build DOT for a node. Returns its node ID.
+        depth=0 is the root -- always shown in full, regardless of max_depth."""
+        if self.max_depth is not None and depth > self.max_depth:
+            nid = self.fresh_id()
+            self.add_node(nid, "...", color="#dddddd")
+            return nid
+
         if node is None:
             nid = self.fresh_id()
             self.add_node(nid, "(none)", color="#cccccc")
@@ -80,11 +87,11 @@ class DotBuilder:
 
         # A case_statement node
         if "branches" in node:
-            return self._visit_case(node)
+            return self._visit_case(node, depth)
 
         # An if_statement node
         if "condition" in node:
-            return self._visit_if(node)
+            return self._visit_if(node, depth)
 
         # A function call or other dict
         if "function" in node:
@@ -95,7 +102,7 @@ class DotBuilder:
             self.add_node(nid, "\n".join(label_lines), color="#c8e6c9")
             if "actions" in node:
                 for action in node["actions"]:
-                    action_id = self.visit(action)
+                    action_id = self.visit(action, depth + 1)
                     self.add_edge(nid, action_id)
             return nid
 
@@ -104,7 +111,7 @@ class DotBuilder:
         self.add_node(nid, str(node))
         return nid
 
-    def _visit_if(self, node):
+    def _visit_if(self, node, depth=0):
         """Visit an if_statement node (which may also be a resolved function
         call carrying function/defined_in/before, e.g. run_deploy())."""
         nid = self.fresh_id()
@@ -119,22 +126,22 @@ class DotBuilder:
         # Condition detail (if present and detailed mode)
         if self.detailed and "condition_detail" in node:
             detail = node["condition_detail"]
-            detail_id = self.visit(detail)
+            detail_id = self.visit(detail, depth + 1)
             self.add_edge(nid, detail_id, "detail")
 
         # Yes branch
         yes_node = node.get("yes")
-        yes_id = self.visit(yes_node)
+        yes_id = self.visit(yes_node, depth + 1)
         self.add_edge(nid, yes_id, "yes")
 
         # No branch
         no_node = node.get("no")
-        no_id = self.visit(no_node)
+        no_id = self.visit(no_node, depth + 1)
         self.add_edge(nid, no_id, "no")
 
         return nid
 
-    def _visit_case(self, node):
+    def _visit_case(self, node, depth=0):
         """Visit a case_statement node."""
         nid = self.fresh_id()
         case_value = node.get("case_value") or "?"
@@ -146,14 +153,14 @@ class DotBuilder:
         # Value detail (if present and detailed mode)
         if self.detailed and "value_detail" in node:
             detail = node["value_detail"]
-            detail_id = self.visit(detail)
+            detail_id = self.visit(detail, depth + 1)
             self.add_edge(nid, detail_id, "detail")
 
         # Case branches
         for branch in node.get("branches", []):
             pattern = branch.get("pattern", "?")
             then_node = branch.get("then")
-            then_id = self.visit(then_node)
+            then_id = self.visit(then_node, depth + 1)
             self.add_edge(nid, then_id, pattern)
 
         return nid
@@ -164,9 +171,9 @@ class DotBuilder:
         return "\n".join(self.lines)
 
 
-def render_dot(tree_json, detailed=True, show_before=False):
+def render_dot(tree_json, detailed=True, show_before=False, max_depth=None):
     """Convert a single decision-tree JSON to DOT format."""
-    builder = DotBuilder(detailed=detailed, show_before=show_before)
+    builder = DotBuilder(detailed=detailed, show_before=show_before, max_depth=max_depth)
     builder.visit(tree_json)
     return builder.build()
 
@@ -181,6 +188,10 @@ def main():
                      help="Omit condition_detail/value_detail edges (shown by default)")
     ap.add_argument("--show-before", action="store_true",
                      help="Show 'before' actions inside the owning node's label (hidden by default)")
+    ap.add_argument("--depth", type=int, default=None,
+                     help="Only show nodes up to this many levels below the root (root itself is "
+                          "always shown in full); deeper branches are collapsed into a '...' node. "
+                          "Unlimited by default.")
     args = ap.parse_args()
 
     data = json.loads(args.input.read_text(encoding="utf-8"))
@@ -189,7 +200,8 @@ def main():
     count = 0
     for filename, trees in data.items():
         for i, tree in enumerate(trees):
-            dot = render_dot(tree, detailed=not args.simple, show_before=args.show_before)
+            dot = render_dot(tree, detailed=not args.simple, show_before=args.show_before,
+                              max_depth=args.depth)
             out_path = args.outdir / f"{Path(filename).stem}_{i + 1}.dot"
             out_path.write_text(dot, encoding="utf-8")
             print(f"Wrote {out_path}", file=sys.stderr)
