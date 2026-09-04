@@ -210,8 +210,12 @@ def _simplify_branch(body, functions: dict, visited: frozenset):
 
 def _simplify_case(node: dict, functions: dict, visited: frozenset) -> dict:
     value = node.get("case_value")
+    is_call = bool(value) and value["type"] == "call"
+    negated_prefix = ""
+    if is_call and value["text"].lstrip().startswith("!"):
+        negated_prefix = "! "
     result = {
-        "case_value": (f'{value["function"]}()' if value and value["type"] == "call" else (value["text"] if value else None)),
+        "case_value": (f'{negated_prefix}{value["function"]}()' if is_call else (value["text"] if value else None)),
         "branches": [
             {"pattern": b["pattern"], "then": _simplify_branch(b.get("then"), functions, visited)}
             for b in node.get("branches", [])
@@ -246,7 +250,9 @@ def _simplify_if(if_node: dict, functions: dict, visited: frozenset) -> dict:
     # away its internal branching - attach it as a side-detail so nothing
     # is lost, while the outer yes/no keeps driving the actual flow.
     if condition and condition["type"] == "call":
-        node["condition"] = f'{condition["function"]}()'
+        negated = condition["text"].lstrip().startswith("!")
+        prefix = "! " if negated else ""
+        node["condition"] = f'{prefix}{condition["function"]}()'
         node["condition_detail"] = _expand_call(condition["function"], functions, visited)
 
     node["yes"] = _simplify_branch(if_node.get("then"), functions, visited)
