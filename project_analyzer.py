@@ -226,14 +226,20 @@ def find_nested_ifs(node, source: bytes, known_functions: set) -> list:
 def build_top_level_sequence(root, source: bytes, known_functions: set) -> list:
     """
     Build top-level decision trees while preserving statements that
-    occur between/after decisions.
+    occur before, between, and after decisions.
 
-    Each top-level if/case gets an `after_actions` field containing
-    the plain commands that occur after it and before the next
-    decision.
+    Leading statements before the first if/case are attached to the
+    first decision as `before_actions`.
+
+    Statements occurring after a decision and before the next decision
+    are attached to that decision as `after_actions`.
+
+    This keeps the existing top-level decision-tree structure while
+    preventing sequential commands from being silently lost.
     """
     result = []
 
+    leading_actions = []
     current_decision = None
 
     for child in root.named_children:
@@ -254,6 +260,11 @@ def build_top_level_sequence(root, source: bytes, known_functions: set) -> list:
                     known_functions
                 )
 
+            # Statements before the first decision belong to the first
+            # decision as "before_actions".
+            if current_decision is None and leading_actions:
+                decision["before_actions"] = leading_actions
+
             result.append(decision)
             current_decision = decision
             continue
@@ -272,29 +283,43 @@ def build_top_level_sequence(root, source: bytes, known_functions: set) -> list:
                 continue
 
             if current_decision is not None:
-                current_decision.setdefault("after_actions", []).append(action)
+                current_decision.setdefault(
+                    "after_actions", []
+                ).append(action)
+            else:
+                leading_actions.append(action)
 
         elif child.type in COMPOUND_TYPES:
             text = node_text(child, source)
 
-            if text and current_decision is not None:
-                current_decision.setdefault(
-                    "after_actions", []
-                ).append({
+            if text:
+                action = {
                     "type": "block",
                     "text": text
-                })
+                }
+
+                if current_decision is not None:
+                    current_decision.setdefault(
+                        "after_actions", []
+                    ).append(action)
+                else:
+                    leading_actions.append(action)
 
         else:
             text = node_text(child, source)
 
-            if text and current_decision is not None:
-                current_decision.setdefault(
-                    "after_actions", []
-                ).append({
+            if text:
+                action = {
                     "type": "other",
                     "text": text
-                })
+                }
+
+                if current_decision is not None:
+                    current_decision.setdefault(
+                        "after_actions", []
+                    ).append(action)
+                else:
+                    leading_actions.append(action)
 
     return result
 
