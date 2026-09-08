@@ -38,19 +38,31 @@ def _clean_label(text: str) -> str:
     return m.group(1) if m else text
 
 
-def _terminates(value) -> bool:
-    """True if a branch's visible content ends with a return/exit
-    statement, meaning execution doesn't fall through to whatever comes
-    next - so no further continuation should be chained onto it.
-    For a nested decision (if/case) or an expanded-call dict, whether
-    EVERY path through it terminates isn't tracked, so we conservatively
-    say no (better to over-attach a continuation than lose one)."""
+_RETURN_RE = re.compile(r"^\s*return\b")
+_EXIT_RE = re.compile(r"^\s*exit\b")
+
+
+def _terminates(value, respect_return=True):
     if value is None:
         return False
+
     if isinstance(value, str):
-        return bool(_TERMINATOR_RE.match(value.strip()))
+        text = value.strip()
+
+        if _EXIT_RE.match(text):
+            return True
+
+        if respect_return and _RETURN_RE.match(text):
+            return True
+
+        return False
+
     if isinstance(value, list):
-        return bool(value) and _terminates(value[-1])
+        return bool(value) and _terminates(
+            value[-1],
+            respect_return=respect_return
+        )
+
     return False
 
 
@@ -58,51 +70,82 @@ _expand_cache = {}
 
 
 def _expand_call(fname: str, functions: dict, visited: frozenset):
-    """Expands a function by name. Cached per (fname, visited) so a
-    function referenced from many call sites across a large project
-    (e.g. log_error, check_network_connectivity) is only ever built
-    once, not rebuilt from scratch at every reference -- without this,
-    cost grows combinatorially with how interconnected the project is."""
     key = (fname, visited)
+
     if key in _expand_cache:
         return copy.deepcopy(_expand_cache[key])
 
     if fname in visited:
-        result = f"{fname}()  [recursive - see functions.{fname} in the raw JSON]"
-        _expand_cache[key] = result
-        return result
+        result = (
+            f"{fname}()  "
+            f"[recursive - see functions.{fname} in the raw JSON]"
+        )
+
+        _expand_cache[key] = copy.deepcopy(result)
+        return copy.deepcopy(result)
 
     func = functions.get(fname)
+
     if not func:
-        result = f"{fname}()  [not defined in the analyzed files]"
-        _expand_cache[key] = result
-        return result
+        result = (
+            f"{fname}()  "
+            f"[not defined in the analyzed files]"
+        )
+
+        _expand_cache[key] = copy.deepcopy(result)
+        return copy.deepcopy(result)
 
     if func.get("nested_ifs"):
-        node = _simplify_sequence(func["nested_ifs"], functions, visited | {fname})
-        leading = [_clean_label(a["text"]) for a in func.get("actions", [])]
-        trailing = [_clean_label(a["text"]) for a in func.get("after_actions", [])]
+        node = _simplify_sequence(
+            func["nested_ifs"],
+            functions,
+            visited | {fname}
+        )
+
+        leading = [
+            _clean_label(a["text"])
+            for a in func.get("actions", [])
+        ]
+
+        trailing = [
+            _clean_label(a["text"])
+            for a in func.get("after_actions", [])
+        ]
+
         if leading:
             node["before"] = leading
+
         if trailing:
-            node = _attach_trailing(node, trailing)
+            node = _attach_trailing(
+                node,
+                trailing
+            )
+
         node["function"] = fname
         node["defined_in"] = func.get("defined_in")
-        _expand_cache[key] = copy.deepcopy(node)
-        return node
 
-    labels = [_clean_label(a["text"]) for a in func.get("actions", [])]
+        _expand_cache[key] = copy.deepcopy(node)
+        return copy.deepcopy(node)
+
+    labels = [
+        _clean_label(a["text"])
+        for a in func.get("actions", [])
+    ]
+
     if not labels:
         result = f"{fname}()"
-        _expand_cache[key] = result
-        return result
+
+        _expand_cache[key] = copy.deepcopy(result)
+        return copy.deepcopy(result)
+
     result = {
         "function": fname,
         "defined_in": func.get("defined_in"),
         "actions": labels,
     }
-    _expand_cache[key] = result
-    return result
+
+    _expand_cache[key] = copy.deepcopy(result)
+    return copy.deepcopy(result)
 
 
 def _simplify_node(node: dict, functions: dict, visited: frozenset) -> dict:
@@ -170,42 +213,54 @@ def _append_continuation(existing, continuation):
         return existing_list + [continuation]
     return existing
 
-def _append_to_fallthrough(node, continuation):
+def _append_to_fallthrough(node, continuation, respect_return=True):
     """
     Append continuation to every path that can naturally fall through.
 
-    A path that ends in return/exit must remain untouched.
-    Nested if/case decisions are traversed recursively so the
-    continuation reaches all non-terminating leaves.
+    If respect_return=True, `return` is treated as a terminator.
+    This is correct for normal control flow inside the current scope.
+
+    If respect_return=False, `return` inside an expanded function call
+    is treated as returning control to the caller, so the continuation
+    must still be attached after it.
     """
     if node is None:
         return continuation
 
     if isinstance(node, (str, list)):
-        if _terminates(node):
+        if respect_return and _terminates(node):
             return node
-        return _append_continuation(node, continuation)
+
+        return _append_continuation(
+            node,
+            continuation
+        )
 
     if isinstance(node, dict):
+
         # case statement
         if "branches" in node:
             for branch in node["branches"]:
                 branch["then"] = _append_to_fallthrough(
                     branch.get("then"),
-                    copy.deepcopy(continuation)
+                    copy.deepcopy(continuation),
+                    respect_return=respect_return
                 )
+
             return node
 
         # if statement
         if "condition" in node:
             node["yes"] = _append_to_fallthrough(
                 node.get("yes"),
-                copy.deepcopy(continuation)
+                copy.deepcopy(continuation),
+                respect_return=respect_return
             )
 
             node["no"] = _append_to_fallthrough(
                 node.get("no"),
-                copy.deepcopy(continuation)
+                copy.deepcopy(continuation),
+                respect_return=respect_return
             )
 
             return node
@@ -240,41 +295,83 @@ def _simplify_branch(body, functions: dict, visited: frozenset):
     actions = body.get("actions", [])
     nested_ifs = body.get("nested_ifs", [])
     after_actions = body.get("after_actions", [])
-    leading = [_clean_label(a["text"]) for a in actions]
-    trailing = [_clean_label(a["text"]) for a in after_actions]
 
-    # Direct nested if/else statement(s) inside this branch -> that's the
-    # continuation (chain them if there's more than one in sequence).
-    # Any plain actions that came before it in the same body are kept as
-    # "before" context; anything that came after is chained on as the
-    # natural fallthrough (e.g. a guard-clause chain ending in `return 0`).
+    leading = [
+        _clean_label(a["text"])
+        for a in actions
+    ]
+
+    trailing = [
+        _clean_label(a["text"])
+        for a in after_actions
+    ]
+
+    # ---------------------------------------------------------
+    # First handle nested decisions.
+    # ---------------------------------------------------------
     if nested_ifs:
-        node = _simplify_sequence(nested_ifs, functions, visited)
+        node = _simplify_sequence(
+            nested_ifs,
+            functions,
+            visited
+        )
+
         if leading and isinstance(node, dict):
             node["before"] = leading
+
         if trailing:
-            node = _attach_trailing(node, trailing)
+            node = _attach_trailing(
+                node,
+                trailing
+            )
+
         return node
 
-    # The LAST action is a call to a function that itself branches ->
-    # inline-expand it (e.g. `echo "..."; run_deploy`). Earlier actions in
-    # the same branch are kept as "before" context on the expanded node.
-    if actions and actions[-1]["type"] == "call":
-        expanded = _expand_call(actions[-1]["function"], functions, visited)
-        leading_before_call = leading[:-1]
-        if leading_before_call:
-            if isinstance(expanded, dict):
-                expanded["before"] = leading_before_call
-            elif isinstance(expanded, str):
-                expanded = leading_before_call + [expanded]
-            elif isinstance(expanded, list):
-                expanded = leading_before_call + expanded
-        return expanded
-
-    # Otherwise: plain terminal leaf/leaves.
-    if not leading:
+    # ---------------------------------------------------------
+    # No nested decisions.
+    #
+    # Process actions from left to right.
+    # ---------------------------------------------------------
+    if not actions:
         return None
-    return leading[0] if len(leading) == 1 else leading
+
+    result = None
+
+    for action in actions:
+        if action["type"] == "call":
+            expanded = _expand_call(
+                action["function"],
+                functions,
+                visited
+            )
+
+            if result is None:
+                result = expanded
+            else:
+                result = _append_to_fallthrough(
+                    result,
+                    expanded
+                )
+
+        else:
+            label = _clean_label(
+                action["text"]
+            )
+
+            if result is None:
+                result = label
+            else:
+               result = _append_to_fallthrough(result,[label],respect_return=False)
+    # ---------------------------------------------------------
+    # Actions after nested/normal actions.
+    # ---------------------------------------------------------
+    if trailing:
+        result = _append_to_fallthrough(
+            result,
+            trailing
+        )
+
+    return result
 
 
 def _simplify_case(node: dict, functions: dict, visited: frozenset) -> dict:
@@ -294,6 +391,11 @@ def _simplify_case(node: dict, functions: dict, visited: frozenset) -> dict:
         result["line"] = node["line"]
     if value and value["type"] == "call":
         result["value_detail"] = _expand_call(value["function"], functions, visited)
+
+    before_actions = node.get("before_actions") or []
+
+    if before_actions:
+        result["before"] = [_clean_label(a["text"]) for a in before_actions]
     return result
 
 
@@ -358,11 +460,8 @@ def _simplify_if(if_node: dict, functions: dict, visited: frozenset) -> dict:
             visited
         )
 
-    # ---------------------------------------------------------
-    # IMPORTANT:
-    # Actions after this `if` execute on every path that
-    # naturally falls through the decision.
-    # ---------------------------------------------------------
+    # Actions that occur after this decision must execute on every
+    # non-terminating path.
     after_actions = if_node.get("after_actions") or []
 
     if after_actions:
@@ -380,6 +479,16 @@ def _simplify_if(if_node: dict, functions: dict, visited: frozenset) -> dict:
             node["no"],
             trailing
         )
+
+    # Actions that happened before this decision belong to the decision
+    # itself, rather than being treated as a third execution branch.
+    before_actions = if_node.get("before_actions") or []
+
+    if before_actions:
+        node["before"] = [
+            _clean_label(a["text"])
+            for a in before_actions
+        ]
 
     return node
 
