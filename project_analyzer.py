@@ -223,6 +223,80 @@ def find_nested_ifs(node, source: bytes, known_functions: set) -> list:
             found.extend(find_nested_ifs(child, source, known_functions))
     return found
 
+def build_top_level_sequence(root, source: bytes, known_functions: set) -> list:
+    """
+    Build top-level decision trees while preserving statements that
+    occur between/after decisions.
+
+    Each top-level if/case gets an `after_actions` field containing
+    the plain commands that occur after it and before the next
+    decision.
+    """
+    result = []
+
+    current_decision = None
+
+    for child in root.named_children:
+        if child.type == "comment":
+            continue
+
+        if child.type in ("if_statement", "case_statement"):
+            if child.type == "if_statement":
+                decision = build_if_node(
+                    child,
+                    source,
+                    known_functions
+                )
+            else:
+                decision = build_case_node(
+                    child,
+                    source,
+                    known_functions
+                )
+
+            result.append(decision)
+            current_decision = decision
+            continue
+
+        if child.type == "function_definition":
+            continue
+
+        if child.type == "command":
+            action = classify_command(
+                child,
+                source,
+                known_functions
+            )
+
+            if action["type"] == "source":
+                continue
+
+            if current_decision is not None:
+                current_decision.setdefault("after_actions", []).append(action)
+
+        elif child.type in COMPOUND_TYPES:
+            text = node_text(child, source)
+
+            if text and current_decision is not None:
+                current_decision.setdefault(
+                    "after_actions", []
+                ).append({
+                    "type": "block",
+                    "text": text
+                })
+
+        else:
+            text = node_text(child, source)
+
+            if text and current_decision is not None:
+                current_decision.setdefault(
+                    "after_actions", []
+                ).append({
+                    "type": "other",
+                    "text": text
+                })
+
+    return result
 
 def find_top_level_ifs(root, source: bytes, known_functions: set) -> list:
     """Find if_statement/case_statement decision nodes at the top level of
@@ -328,11 +402,8 @@ def analyze_project(file_paths) -> dict:
 
     files_out = {}
     for filename, (root, source_bytes) in parsed.items():
-        files_out[filename] = {
-            "sources": discover_sources(root, source_bytes),
-            "decision_trees": find_top_level_ifs(root, source_bytes, known_function_names),
-        }
-
+       files_out[filename] = {"sources": discover_sources(root, source_bytes),"decision_trees": build_top_level_sequence(
+        root,source_bytes,known_function_names),}
     return {"files": files_out, "functions": functions_out}
 
 
