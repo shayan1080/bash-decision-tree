@@ -35,6 +35,7 @@ class DotBuilder:
         self.detailed = detailed
         self.show_before = show_before
         self.max_depth = max_depth
+        self._seen = {}  # canonical JSON string of a subtree -> node id already built for it
 
     def fresh_id(self):
         nid = self.node_id
@@ -63,12 +64,32 @@ class DotBuilder:
 
     def visit(self, node, depth=0):
         """Recursively visit and build DOT for a node. Returns its node ID.
-        depth=0 is the root -- always shown in full, regardless of max_depth."""
+        depth=0 is the root -- always shown in full, regardless of max_depth.
+
+        Dedup: if an IDENTICAL subtree (same JSON content) was already
+        rendered at the same depth, its existing node id is reused
+        instead of rebuilding a full duplicate copy -- this is what
+        keeps the DOT file a sane size even though simplify.py's JSON
+        deliberately embeds the same "continuation" into every case
+        branch / guard-clause path rather than linking it once."""
         if self.max_depth is not None and depth > self.max_depth:
             nid = self.fresh_id()
             self.add_node(nid, "...", color="#dddddd")
             return nid
 
+        try:
+            key = (depth, json.dumps(node, sort_keys=True))
+        except TypeError:
+            key = None
+        if key is not None and key in self._seen:
+            return self._seen[key]
+
+        nid = self._visit_uncached(node, depth)
+        if key is not None:
+            self._seen[key] = nid
+        return nid
+
+    def _visit_uncached(self, node, depth=0):
         if node is None:
             nid = self.fresh_id()
             self.add_node(nid, "(none)", color="#cccccc")
