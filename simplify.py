@@ -54,13 +54,29 @@ def _terminates(value) -> bool:
     return False
 
 
+_expand_cache = {}
+
+
 def _expand_call(fname: str, functions: dict, visited: frozenset):
+    """Expands a function by name. Cached per (fname, visited) so a
+    function referenced from many call sites across a large project
+    (e.g. log_error, check_network_connectivity) is only ever built
+    once, not rebuilt from scratch at every reference -- without this,
+    cost grows combinatorially with how interconnected the project is."""
+    key = (fname, visited)
+    if key in _expand_cache:
+        return copy.deepcopy(_expand_cache[key])
+
     if fname in visited:
-        return f"{fname}()  [recursive - see functions.{fname} in the raw JSON]"
+        result = f"{fname}()  [recursive - see functions.{fname} in the raw JSON]"
+        _expand_cache[key] = result
+        return result
 
     func = functions.get(fname)
     if not func:
-        return f"{fname}()  [not defined in the analyzed files]"
+        result = f"{fname}()  [not defined in the analyzed files]"
+        _expand_cache[key] = result
+        return result
 
     if func.get("nested_ifs"):
         node = _simplify_sequence(func["nested_ifs"], functions, visited | {fname})
@@ -72,16 +88,21 @@ def _expand_call(fname: str, functions: dict, visited: frozenset):
             node = _attach_trailing(node, trailing)
         node["function"] = fname
         node["defined_in"] = func.get("defined_in")
+        _expand_cache[key] = copy.deepcopy(node)
         return node
 
     labels = [_clean_label(a["text"]) for a in func.get("actions", [])]
     if not labels:
-        return f"{fname}()"
-    return {
+        result = f"{fname}()"
+        _expand_cache[key] = result
+        return result
+    result = {
         "function": fname,
         "defined_in": func.get("defined_in"),
         "actions": labels,
     }
+    _expand_cache[key] = result
+    return result
 
 
 def _simplify_node(node: dict, functions: dict, visited: frozenset) -> dict:
@@ -93,33 +114,39 @@ def _simplify_node(node: dict, functions: dict, visited: frozenset) -> dict:
     return _simplify_if(node, functions, visited)
 
 
-def _simplify_sequence(nested_decisions: list, functions: dict, visited: frozenset) -> dict:
-    """A body can contain more than one sibling if/case decision in
-    sequence (e.g. a guard clause followed by another check, or a
-    validation `case` followed by the real logic). Chains the rest onto
-    every branch that doesn't end in return/exit (see _terminates) -
-    if with no else -> its "no"; case_statement -> every branch; an
-    explicit else/branch that doesn't terminate also gets it, since
-    execution really does continue past it. This still isn't full
-    control-flow analysis (e.g. an early return buried inside a nested
-    if two levels down within a branch won't be noticed) - just the
-    common shapes."""
+def _simplify_sequence(
+    nested_decisions: list,
+    functions: dict,
+    visited: frozenset
+) -> dict:
+    """
+    Simplify a sequence of sibling decisions while preserving
+    normal fall-through control flow.
+
+    Any continuation after a decision is attached to every path
+    that does not terminate with return/exit.
+    """
     first, *rest = nested_decisions
-    node = _simplify_node(first, functions, visited)
+
+    node = _simplify_node(
+        first,
+        functions,
+        visited
+    )
+
     if not rest:
         return node
 
-    continuation = _simplify_sequence(rest, functions, visited)
-    if "branches" in node:
-        for b in node["branches"]:
-            if not _terminates(b["then"]):
-                b["then"] = _append_continuation(b["then"], copy.deepcopy(continuation))
-    else:
-        if not _terminates(node.get("yes")):
-            node["yes"] = _append_continuation(node.get("yes"), copy.deepcopy(continuation))
-        if not _terminates(node.get("no")):
-            node["no"] = _append_continuation(node.get("no"), continuation)
-    return node
+    continuation = _simplify_sequence(
+        rest,
+        functions,
+        visited
+    )
+
+    return _append_to_fallthrough(
+        node,
+        continuation
+    )
 
 
 def _append_continuation(existing, continuation):
@@ -142,6 +169,48 @@ def _append_continuation(existing, continuation):
             return existing_list + continuation
         return existing_list + [continuation]
     return existing
+
+def _append_to_fallthrough(node, continuation):
+    """
+    Append continuation to every path that can naturally fall through.
+
+    A path that ends in return/exit must remain untouched.
+    Nested if/case decisions are traversed recursively so the
+    continuation reaches all non-terminating leaves.
+    """
+    if node is None:
+        return continuation
+
+    if isinstance(node, (str, list)):
+        if _terminates(node):
+            return node
+        return _append_continuation(node, continuation)
+
+    if isinstance(node, dict):
+        # case statement
+        if "branches" in node:
+            for branch in node["branches"]:
+                branch["then"] = _append_to_fallthrough(
+                    branch.get("then"),
+                    copy.deepcopy(continuation)
+                )
+            return node
+
+        # if statement
+        if "condition" in node:
+            node["yes"] = _append_to_fallthrough(
+                node.get("yes"),
+                copy.deepcopy(continuation)
+            )
+
+            node["no"] = _append_to_fallthrough(
+                node.get("no"),
+                copy.deepcopy(continuation)
+            )
+
+            return node
+
+    return node
 
 
 def _attach_trailing(node, trailing: list):
@@ -242,41 +311,195 @@ def _elif_chain_to_if(elif_branches, else_branch):
 
 def _simplify_if(if_node: dict, functions: dict, visited: frozenset) -> dict:
     condition = if_node.get("condition")
-    node = {"condition": condition["text"] if condition else None}
+
+    node = {
+        "condition": condition["text"] if condition else None
+    }
+
     if "line" in if_node:
         node["line"] = if_node["line"]
 
-    # If the condition itself is a call to a known function, don't throw
-    # away its internal branching - attach it as a side-detail so nothing
-    # is lost, while the outer yes/no keeps driving the actual flow.
     if condition and condition["type"] == "call":
         negated = condition["text"].lstrip().startswith("!")
         prefix = "! " if negated else ""
-        node["condition"] = f'{prefix}{condition["function"]}()'
-        node["condition_detail"] = _expand_call(condition["function"], functions, visited)
 
-    node["yes"] = _simplify_branch(if_node.get("then"), functions, visited)
+        node["condition"] = f'{prefix}{condition["function"]}()'
+
+        node["condition_detail"] = _expand_call(
+            condition["function"],
+            functions,
+            visited
+        )
+
+    node["yes"] = _simplify_branch(
+        if_node.get("then"),
+        functions,
+        visited
+    )
 
     elif_branches = if_node.get("elif_branches") or []
     else_branch = if_node.get("else")
 
     if elif_branches:
-        synthetic = _elif_chain_to_if(elif_branches, else_branch)
-        node["no"] = _simplify_if(synthetic, functions, visited)
+        synthetic = _elif_chain_to_if(
+            elif_branches,
+            else_branch
+        )
+
+        node["no"] = _simplify_if(
+            synthetic,
+            functions,
+            visited
+        )
     else:
-        node["no"] = _simplify_branch(else_branch, functions, visited)
+        node["no"] = _simplify_branch(
+            else_branch,
+            functions,
+            visited
+        )
+
+    # ---------------------------------------------------------
+    # IMPORTANT:
+    # Actions after this `if` execute on every path that
+    # naturally falls through the decision.
+    # ---------------------------------------------------------
+    after_actions = if_node.get("after_actions") or []
+
+    if after_actions:
+        trailing = [
+            _clean_label(a["text"])
+            for a in after_actions
+        ]
+
+        node["yes"] = _append_to_fallthrough(
+            node["yes"],
+            trailing
+        )
+
+        node["no"] = _append_to_fallthrough(
+            node["no"],
+            trailing
+        )
+
+    return node
+
+
+_RETURN_RE = re.compile(r"^\s*return\s+(\d+)\s*$")
+
+
+def _leaf_truth(value):
+    """For a terminal leaf (str, list of str, or None), determine if it
+    resolves to True (return 0), False (return N != 0), or None
+    (ambiguous -- no explicit numeric return here)."""
+    if isinstance(value, list):
+        value = value[-1] if value else None
+    if not isinstance(value, str):
+        return None
+    m = _RETURN_RE.match(value.strip())
+    if m:
+        return int(m.group(1)) == 0
+    return None
+
+
+_MAX_FLATTEN_DEPTH = 6
+
+
+def _try_flatten(detail, outer_yes, outer_no, negated=False, _depth=0):
+    """Recursively walks a condition_detail sub-tree, replacing every
+    leaf that resolves to true/false with the outer yes/no content.
+    Returns (flattened_tree, all_resolved) -- all_resolved is False if
+    any leaf was ambiguous, in which case the caller keeps the original
+    node (with its condition_detail side-branch) unchanged rather than
+    asserting something we're not sure of. Cascades through nested
+    condition_detail-of-a-detail levels too, as far as they stay
+    unambiguous -- capped at _MAX_FLATTEN_DEPTH as a safety net so a
+    pathological chain of details can't blow up recursion/copy cost."""
+    if _depth > _MAX_FLATTEN_DEPTH:
+        return detail, False
+
+    ambiguous = [False]
+
+    def walk(d):
+        if isinstance(d, dict):
+            if "branches" in d:
+                return {**d, "branches": [{**b, "then": walk(b.get("then"))} for b in d["branches"]]}
+            if "condition" in d:
+                new_d = dict(d)
+                new_d["yes"] = walk(d.get("yes"))
+                new_d["no"] = walk(d.get("no"))
+                inner_detail = new_d.get("condition_detail")
+                if inner_detail is not None:
+                    inner_negated = new_d.get("condition", "").lstrip().startswith("!")
+                    inner_flat, inner_ok = _try_flatten(inner_detail,new_d["yes"],new_d["no"],negated=inner_negated,
+                    _depth=_depth + 1)
+                    if inner_ok:
+                        new_d = inner_flat
+                return new_d
+            ambiguous[0] = True
+            return d
+        truth = _leaf_truth(d)
+
+        if truth is True:
+            return copy.deepcopy(outer_no if negated else outer_yes)
+
+        if truth is False:
+            return copy.deepcopy(outer_yes if negated else outer_no)
+
+        ambiguous[0] = True
+        return d
+
+    flattened = walk(detail)
+    return flattened, not ambiguous[0]
+
+
+def _flatten_node(node):
+    """Recursively applies the flattening across a whole simplified tree:
+    wherever a node has a condition_detail (or a case has a value_detail)
+    that resolves unambiguously via explicit return codes, the detail
+    side-branch is folded directly into the tree (replacing the node),
+    so the final tree only ever has yes/no or case branches -- no
+    separate "detail" branch left over. Ambiguous cases keep their
+    original condition_detail, unchanged, as a safe fallback."""
+    if not isinstance(node, dict):
+        return node
+
+    if "branches" in node:
+        node["branches"] = [
+            {**b, "then": _flatten_node(b.get("then"))}
+            for b in node["branches"]
+        ]
+        return node
+
+    if "condition" in node:
+        node["yes"] = _flatten_node(node.get("yes"))
+        node["no"] = _flatten_node(node.get("no"))
+
+        detail = node.get("condition_detail")
+        if detail is not None:
+            negated = node.get("condition", "").lstrip().startswith("!")
+            flattened, all_resolved = _try_flatten(detail,node["yes"],node["no"],negated=negated)
+            if all_resolved:
+                if "before" in node and isinstance(flattened, dict):
+                    flattened["before"] = node["before"] + flattened.get("before", [])
+                return flattened
+        return node
 
     return node
 
 
 def simplify_project(analysis: dict) -> dict:
     """Top-level entry point. Returns {filename: [clean_tree, ...]} for
-    every file that has at least one top-level if-statement."""
+    every file that has at least one top-level if-statement. Trees are
+    flattened as a final pass: wherever a condition_detail resolves
+    unambiguously (explicit return 0 / return N), it's folded directly
+    into the tree instead of kept as a side "detail" branch, so the
+    result is a pure yes/no (or case-branch) tree wherever possible."""
+    _expand_cache.clear()
     functions = analysis.get("functions", {})
     out = {}
     for filename, info in analysis.get("files", {}).items():
         trees = info.get("decision_trees") or []
         if not trees:
             continue
-        out[filename] = [_simplify_node(t, functions, frozenset()) for t in trees]
+        out[filename] = [_flatten_node(_simplify_node(t, functions, frozenset())) for t in trees]
     return out
