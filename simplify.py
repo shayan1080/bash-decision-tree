@@ -222,13 +222,15 @@ def _append_to_fallthrough(node, continuation, respect_return=True):
 
     If respect_return=False, `return` inside an expanded function call
     is treated as returning control to the caller, so the continuation
-    must still be attached after it.
+    must still be attached after it. `exit` is always a terminator
+    regardless of respect_return, since it ends the whole shell process,
+    not just the current function's scope.
     """
     if node is None:
         return continuation
 
     if isinstance(node, (str, list)):
-        if respect_return and _terminates(node):
+        if _terminates(node, respect_return=respect_return):
             return node
 
         return _append_continuation(
@@ -263,6 +265,19 @@ def _append_to_fallthrough(node, continuation, respect_return=True):
                 respect_return=respect_return
             )
 
+            return node
+
+        # A plain action-list leaf (an expanded function call with no
+        # nested_ifs, e.g. {"function":..., "actions":[...]}) - this
+        # shape has no branches/condition to recurse into, so the
+        # continuation belongs right after its own action list, subject
+        # to the same termination rule as the str/list case above.
+        if "actions" in node:
+            if _terminates(node["actions"], respect_return=respect_return):
+                return node
+            node["actions"] = node["actions"] + (
+                continuation if isinstance(continuation, list) else [continuation]
+            )
             return node
 
     return node
@@ -350,7 +365,8 @@ def _simplify_branch(body, functions: dict, visited: frozenset):
             else:
                 result = _append_to_fallthrough(
                     result,
-                    expanded
+                    expanded,
+                    respect_return=False
                 )
 
         else:
