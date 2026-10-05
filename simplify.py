@@ -107,16 +107,17 @@ def _expand_call(fname: str, functions: dict, visited: frozenset):
             for a in func.get("actions", [])
         ]
 
-        trailing = [
-            _clean_label(a["text"])
-            for a in func.get("after_actions", [])
-        ]
+        trailing = _simplify_action_sequence(
+            func.get("after_actions", []),
+            functions,
+            visited | {fname}
+        )
 
         if leading:
             node["before"] = leading
 
         if trailing:
-            node = _attach_trailing(
+            node = _append_to_fallthrough(
                 node,
                 trailing
             )
@@ -127,22 +128,36 @@ def _expand_call(fname: str, functions: dict, visited: frozenset):
         _expand_cache[key] = copy.deepcopy(node)
         return copy.deepcopy(node)
 
-    labels = [
-        _clean_label(a["text"])
-        for a in func.get("actions", [])
-    ]
+    labels = _simplify_action_sequence(
+        func.get("actions", []),
+        functions,
+        visited | {fname}
+    )
 
-    if not labels:
+    if labels is None:
         result = f"{fname}()"
 
         _expand_cache[key] = copy.deepcopy(result)
         return copy.deepcopy(result)
 
-    result = {
-        "function": fname,
-        "defined_in": func.get("defined_in"),
-        "actions": labels,
-    }
+    if isinstance(labels, dict):
+        # The body's own content is already a nested call (or a
+        # decision) with its OWN function/defined_in identity - don't
+        # stomp on it by tagging it as fname. Instead wrap fname as its
+        # own (empty-bodied) leaf that leads straight into it, the same
+        # way a decision node points at whatever follows it.
+        result = {
+            "function": fname,
+            "defined_in": func.get("defined_in"),
+            "actions": [],
+            "then": labels,
+        }
+    else:
+        result = {
+            "function": fname,
+            "defined_in": func.get("defined_in"),
+            "actions": labels if isinstance(labels, list) else [labels],
+        }
 
     _expand_cache[key] = copy.deepcopy(result)
     return copy.deepcopy(result)
@@ -226,6 +241,15 @@ def _append_to_fallthrough(node, continuation, respect_return=True):
     regardless of respect_return, since it ends the whole shell process,
     not just the current function's scope.
     """
+    # Work on a private copy: `continuation` may be the SAME object the
+    # caller is about to attach to more than one path (e.g. both the
+    # "yes" and "no" of a decision, or multiple case branches). Every
+    # path below either returns `continuation` directly or mutates a
+    # dict in place (see _append_continuation's "before" merge) - without
+    # this, two branches that both received the same object would end
+    # up silently sharing (and corrupting) each other's content.
+    continuation = copy.deepcopy(continuation)
+
     if node is None:
         return continuation
 
@@ -268,88 +292,40 @@ def _append_to_fallthrough(node, continuation, respect_return=True):
             return node
 
         # A plain action-list leaf (an expanded function call with no
-        # nested_ifs, e.g. {"function":..., "actions":[...]}) - this
+        # nested_ifs, e.g. {"function":..., "actions":[...]}). This
         # shape has no branches/condition to recurse into, so the
-        # continuation belongs right after its own action list, subject
-        # to the same termination rule as the str/list case above.
+        # continuation belongs right after it - but it must NOT be
+        # merged into "actions": that field is the function's own body
+        # and is shared (cached) across every call site of this
+        # function, while the continuation is specific to THIS call
+        # site. Mixing them would both misrepresent the function's own
+        # logic (the caller's next steps would look like part of the
+        # callee) and defeat node de-duplication when rendering (the
+        # same shared helper, e.g. a logging function, gets expanded
+        # fresh at every call site instead of being reused), so it's
+        # kept in a separate "then" field instead.
         if "actions" in node:
             if _terminates(node["actions"], respect_return=respect_return):
                 return node
-            node["actions"] = node["actions"] + (
-                continuation if isinstance(continuation, list) else [continuation]
+            node = dict(node)
+            node["then"] = _append_to_fallthrough(
+                node.get("then"),
+                continuation,
+                respect_return=respect_return
             )
             return node
 
     return node
 
 
-def _attach_trailing(node, trailing: list):
-    """Best-effort: append trailing actions (that came after all the
-    nested ifs/cases in a body) onto every leaf that doesn't already
-    terminate with return/exit - every case branch, or the yes/no of an
-    if/elif chain. Still not full control-flow analysis (a return buried
-    two levels deep inside a branch won't be noticed), but a branch whose
-    OWN last visible action is return/exit is now correctly left alone."""
-    if not trailing or _terminates(node):
-        return node
-    if isinstance(node, dict) and "branches" in node:
-        for b in node["branches"]:
-            b["then"] = _attach_trailing(b["then"], trailing)
-        return node
-    if isinstance(node, dict) and "condition" in node:
-        node["yes"] = _attach_trailing(node.get("yes"), trailing)
-        node["no"] = _attach_trailing(node.get("no"), trailing)
-        return node
-    return _append_continuation(node, trailing)
-
-
-def _simplify_branch(body, functions: dict, visited: frozenset):
-    if body is None:
-        return None
-
-    actions = body.get("actions", [])
-    nested_ifs = body.get("nested_ifs", [])
-    after_actions = body.get("after_actions", [])
-
-    leading = [
-        _clean_label(a["text"])
-        for a in actions
-    ]
-
-    trailing = [
-        _clean_label(a["text"])
-        for a in after_actions
-    ]
-
-    # ---------------------------------------------------------
-    # First handle nested decisions.
-    # ---------------------------------------------------------
-    if nested_ifs:
-        node = _simplify_sequence(
-            nested_ifs,
-            functions,
-            visited
-        )
-
-        if leading and isinstance(node, dict):
-            node["before"] = leading
-
-        if trailing:
-            node = _attach_trailing(
-                node,
-                trailing
-            )
-
-        return node
-
-    # ---------------------------------------------------------
-    # No nested decisions.
-    #
-    # Process actions from left to right.
-    # ---------------------------------------------------------
-    if not actions:
-        return None
-
+def _simplify_action_sequence(actions: list, functions: dict, visited: frozenset):
+    """Process a flat list of actions (no nested_ifs) left to right,
+    expanding every "call" action via _expand_call (never just its raw
+    text) and chaining everything together with _append_to_fallthrough.
+    Shared by _simplify_branch (a decision branch's body) and
+    _expand_call (a function's own body when it has no nested_ifs of
+    its own) - a function call must always be expanded the same way
+    regardless of which of the two contexts it's found in."""
     result = None
 
     for action in actions:
@@ -359,6 +335,17 @@ def _simplify_branch(body, functions: dict, visited: frozenset):
                 functions,
                 visited
             )
+
+            # _expand_call only knows the CALLEE's own generic body (it's
+            # cached by function name, shared across every call site), so
+            # it has no way to show what was actually passed at THIS call
+            # site (e.g. `log_error "cannot deploy"` vs `log_error
+            # "disk full"`). Record the real call text here, once per
+            # call site, so that information isn't silently dropped.
+            call_text = _clean_label(action.get("text", action["function"]))
+            if isinstance(expanded, dict) and call_text != f'{action["function"]}':
+                expanded = dict(expanded)
+                expanded["call_text"] = call_text
 
             if result is None:
                 result = expanded
@@ -377,10 +364,56 @@ def _simplify_branch(body, functions: dict, visited: frozenset):
             if result is None:
                 result = label
             else:
-               result = _append_to_fallthrough(result,[label],respect_return=False)
+                result = _append_to_fallthrough(result, [label], respect_return=False)
+
+    return result
+
+
+def _simplify_branch(body, functions: dict, visited: frozenset):
+    if body is None:
+        return None
+
+    actions = body.get("actions", [])
+    nested_ifs = body.get("nested_ifs", [])
+    after_actions = body.get("after_actions", [])
+
+    leading = [
+        _clean_label(a["text"])
+        for a in actions
+    ]
+
+    trailing = _simplify_action_sequence(after_actions, functions, visited)
+
     # ---------------------------------------------------------
-    # Actions after nested/normal actions.
+    # First handle nested decisions.
     # ---------------------------------------------------------
+    if nested_ifs:
+        node = _simplify_sequence(
+            nested_ifs,
+            functions,
+            visited
+        )
+
+        if leading and isinstance(node, dict):
+            node["before"] = leading
+
+        if trailing:
+            node = _append_to_fallthrough(
+                node,
+                trailing
+            )
+
+        return node
+
+    # ---------------------------------------------------------
+    # No nested decisions.
+    #
+    # Process actions from left to right.
+    # ---------------------------------------------------------
+    if not actions:
+        return None
+
+    result = _simplify_action_sequence(actions, functions, visited)
     if trailing:
         result = _append_to_fallthrough(
             result,
@@ -481,10 +514,7 @@ def _simplify_if(if_node: dict, functions: dict, visited: frozenset) -> dict:
     after_actions = if_node.get("after_actions") or []
 
     if after_actions:
-        trailing = [
-            _clean_label(a["text"])
-            for a in after_actions
-        ]
+        trailing = _simplify_action_sequence(after_actions, functions, visited)
 
         node["yes"] = _append_to_fallthrough(
             node["yes"],
@@ -509,21 +539,76 @@ def _simplify_if(if_node: dict, functions: dict, visited: frozenset) -> dict:
     return node
 
 
-_RETURN_RE = re.compile(r"^\s*return\s+(\d+)\s*$")
+_RETURN_VALUE_RE = re.compile(r"^\s*return\s+(\d+)\s*$")
 
 
 def _leaf_truth(value):
-    """For a terminal leaf (str, list of str, or None), determine if it
-    resolves to True (return 0), False (return N != 0), or None
-    (ambiguous -- no explicit numeric return here)."""
+    """For a terminal leaf, determine if it resolves to True (return 0),
+    False (return N != 0), or None (ambiguous -- no explicit numeric
+    return here). Handles three shapes:
+
+    - str / list of str: the plain case, checked directly.
+    - dict (a call chain, e.g. {"function":"log_error", "actions":[...],
+      "then": [...]}): a helper call before the branch's own return
+      (e.g. `log_error; echo "DB DOWN"; return 1`) is extremely common,
+      so this recurses into "then" to find the truth value, rather than
+      giving up and marking the whole thing ambiguous just because the
+      immediate value isn't a plain str/list.
+
+    Returns (truth, lead): `lead` is whatever ran before the `return`,
+    so callers can keep it instead of throwing it away. For the
+    str/list case `lead` is a list of the preceding actions; for the
+    dict case `lead` is the dict itself (with its own "then" reduced to
+    whatever preceded the return), since a call node can't be flattened
+    into a plain list without losing its own identity."""
+    if isinstance(value, dict):
+        if "then" not in value:
+            return None, None
+        truth, inner_lead = _leaf_truth(value["then"])
+        if truth is None:
+            return None, None
+        new_value = dict(value)
+        if inner_lead:
+            new_value["then"] = inner_lead
+        else:
+            new_value.pop("then", None)
+        return truth, new_value
+
+    if isinstance(value, list):
+        if not value:
+            return None, None
+        last = value[-1]
+        lead = value[:-1]
+    else:
+        last = value
+        lead = []
+    if not isinstance(last, str):
+        return None, None
+    m = _RETURN_VALUE_RE.match(last.strip())
+    if m:
+        return int(m.group(1)) == 0, lead
+    return None, None
+
+
+def _dead_ends_in_exit(value):
+    """True if this leaf's last visible statement is `exit N` (through
+    any depth of dict "then" chaining). A path that ends in `exit` never
+    returns control to its caller at all, so - unlike a genuinely
+    unresolvable leaf (e.g. relying on the implicit exit status of a
+    plain command) - it shouldn't count as "we don't know this
+    function's truth value". It simply isn't a data point: if every
+    OTHER path a function can take agrees on a truth value, that's the
+    function's truth value, regardless of how many of its paths exit
+    instead of returning."""
+    if isinstance(value, dict):
+        if "then" not in value:
+            return False
+        return _dead_ends_in_exit(value["then"])
     if isinstance(value, list):
         value = value[-1] if value else None
     if not isinstance(value, str):
-        return None
-    m = _RETURN_RE.match(value.strip())
-    if m:
-        return int(m.group(1)) == 0
-    return None
+        return False
+    return bool(_EXIT_RE.match(value.strip()))
 
 
 _MAX_FLATTEN_DEPTH = 6
@@ -560,18 +645,39 @@ def _try_flatten(detail, outer_yes, outer_no, negated=False, _depth=0):
                     if inner_ok:
                         new_d = inner_flat
                 return new_d
+            # Any other dict shape falls through to _leaf_truth below,
+            # which knows how to pull a truth value out of a call-leaf
+            # dict (e.g. {"function":"log_error", "then":[...]}) by
+            # looking inside its "then" chain instead of giving up.
+        truth, lead = _leaf_truth(d)
+
+        if truth is None:
+            # A path that dead-ends in `exit` never returns at all, so
+            # it isn't evidence of ambiguity - it's simply excluded from
+            # the vote. Leave it exactly as-is (nothing to attach a
+            # continuation to) without blocking the OTHER paths from
+            # resolving.
+            if _dead_ends_in_exit(d):
+                return d
             ambiguous[0] = True
             return d
-        truth = _leaf_truth(d)
 
-        if truth is True:
-            return copy.deepcopy(outer_no if negated else outer_yes)
+        target = copy.deepcopy(outer_no if negated else outer_yes) if truth \
+            else copy.deepcopy(outer_yes if negated else outer_no)
 
-        if truth is False:
-            return copy.deepcopy(outer_yes if negated else outer_no)
-
-        ambiguous[0] = True
-        return d
+        # Actions that ran before the `return` inside the inner function
+        # are real, visible behavior (e.g. "DB OK") - keep them, spliced
+        # in right before the outer continuation they lead into. Only the
+        # `return N` itself was consumed to resolve the truth value.
+        if isinstance(lead, dict):
+            # A call chain (e.g. log_error(); "DB DOWN"; return 1) - use
+            # _append_to_fallthrough so `target` is spliced onto the
+            # actual tail of the chain (inside "then"), not tacked onto
+            # the call node itself.
+            return _append_to_fallthrough(lead, target, respect_return=False)
+        if lead:
+            return _append_continuation(list(lead), target)
+        return target
 
     flattened = walk(detail)
     return flattened, not ambiguous[0]
@@ -601,6 +707,17 @@ def _flatten_node(node):
 
         detail = node.get("condition_detail")
         if detail is not None:
+            # Flatten the detail sub-tree on its own first, independent
+            # of whether THIS level resolves. Otherwise, if the outer
+            # function (e.g. one with no explicit `return`, relying on
+            # the implicit exit status of its last command) can't be
+            # resolved, everything nested inside it - even fully
+            # independent, resolvable calls several levels down - would
+            # be thrown away along with it and left as raw, un-flattened
+            # "detail" branches.
+            detail = _flatten_node(detail)
+            node["condition_detail"] = detail
+
             negated = node.get("condition", "").lstrip().startswith("!")
             flattened, all_resolved = _try_flatten(detail,node["yes"],node["no"],negated=negated)
             if all_resolved:

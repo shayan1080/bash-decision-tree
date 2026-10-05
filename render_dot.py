@@ -36,6 +36,10 @@ class DotBuilder:
         self.show_before = show_before
         self.max_depth = max_depth
         self._seen = {}  # canonical JSON string of a subtree -> node id already built for it
+        self._body_cache = {}  # (function, defined_in, actions tuple) -> node id of the
+                                # shared function-body node, reused across every call site
+                                # so a widely-used helper (e.g. a logging function) isn't
+                                # redrawn from scratch each time it's called.
 
     def fresh_id(self):
         nid = self.node_id
@@ -116,15 +120,58 @@ class DotBuilder:
 
         # A function call or other dict
         if "function" in node:
+            # The function's own body (its actions) is identical at every
+            # call site, so it CAN be shared -- but only when nothing
+            # site-specific hangs off it. If this call has a "then"
+            # (a continuation that belongs only to THIS call site),
+            # reusing a shared body node would attach every call site's
+            # "then" to the same node, making the diagram falsely show
+            # the function branching to all of them at once. So the
+            # cache is only consulted/populated for calls with no
+            # "then" -- the common case for a helper like a logger that
+            # is simply the last thing on its path -- and any call that
+            # does have a "then" is rendered fresh, kept separate from
+            # every other call site.
+            body_key = (
+                node["function"],
+                node.get("defined_in"),
+                tuple(node.get("actions", [])) if isinstance(node.get("actions"), list) else None,
+                tuple(node.get("before", [])) if isinstance(node.get("before"), list) else None,
+                node.get("call_text"),
+            )
+            has_then = node.get("then") is not None
+
+            if not has_then and body_key in self._body_cache:
+                return self._body_cache[body_key]
+
             nid = self.fresh_id()
             label_lines = [f'{node["function"]}()', node.get("defined_in", "")]
-            if self.show_before and node.get("before"):
+            # "call_text" is what was actually invoked at THIS call site
+            # (e.g. `log_error "cannot deploy"`) - the callee's own body
+            # below is generic/shared, so without this the real argument
+            # passed at this call site would be invisible.
+            if node.get("call_text"):
+                label_lines.append("called as: " + node["call_text"])
+            # "before" on a function node is real sequential code that
+            # ran right before this call in the same body (e.g. another
+            # call chained via "then" one level up) - unlike the
+            # optional lead-in on a bare if/case condition, this is
+            # essential control flow, so it's always shown regardless
+            # of show_before.
+            if node.get("before"):
                 label_lines.append("before: " + "; ".join(str(b) for b in node["before"]))
             self.add_node(nid, "\n".join(label_lines), color="#c8e6c9")
             if "actions" in node:
                 for action in node["actions"]:
                     action_id = self.visit(action, depth + 1)
                     self.add_edge(nid, action_id)
+
+            if not has_then:
+                self._body_cache[body_key] = nid
+            else:
+                then_id = self.visit(node["then"], depth + 1)
+                self.add_edge(nid, then_id)
+
             return nid
 
         # Fallback
