@@ -223,7 +223,7 @@ def find_nested_ifs(node, source: bytes, known_functions: set) -> list:
             found.extend(find_nested_ifs(child, source, known_functions))
     return found
 
-def build_top_level_sequence(root, source: bytes, known_functions: set) -> list:
+def build_top_level_sequence(root, source: bytes, known_functions: set, functions_out: dict = None) -> list:
     """
     Build top-level decision trees while preserving statements that
     occur before, between, and after decisions.
@@ -236,11 +236,61 @@ def build_top_level_sequence(root, source: bytes, known_functions: set) -> list:
 
     This keeps the existing top-level decision-tree structure while
     preventing sequential commands from being silently lost.
+
+    A script's real control flow very often isn't a literal if/case
+    sitting at the top of the file at all - the common convention is
+    `main() { ... }` followed by a bare `main "$@"` call, with every
+    if/case living inside that function body instead. Without
+    `functions_out`, such a script has NO if/case at its own top level,
+    so the decision tree comes out completely empty even though the
+    script's actual logic is fully analyzable - it's just one call away.
+    When `functions_out` is provided (the already-built {name: {actions,
+    nested_ifs, after_actions, ...}} map for every function in the
+    project), a bare top-level call to a known function is inlined here
+    exactly as if its body had appeared directly at this point in the
+    script, so its own decisions still populate `result`.
     """
     result = []
 
     leading_actions = []
     current_decision = None
+
+    def inline_call(fname, visited):
+        nonlocal current_decision, leading_actions
+
+        if functions_out is None or fname not in functions_out or fname in visited:
+            return
+
+        visited = visited | {fname}
+        func = functions_out[fname]
+
+        for action in func.get("actions", []):
+            if action["type"] == "call":
+                inline_call(action["function"], visited)
+                continue
+
+            if current_decision is not None:
+                current_decision.setdefault("after_actions", []).append(action)
+            else:
+                leading_actions.append(action)
+
+        for decision in func.get("nested_ifs", []):
+            if current_decision is None and leading_actions:
+                decision["before_actions"] = leading_actions
+                leading_actions = []
+
+            result.append(decision)
+            current_decision = decision
+
+        for action in func.get("after_actions", []):
+            if action["type"] == "call":
+                inline_call(action["function"], visited)
+                continue
+
+            if current_decision is not None:
+                current_decision.setdefault("after_actions", []).append(action)
+            else:
+                leading_actions.append(action)
 
     for child in root.named_children:
         if child.type == "comment":
@@ -280,6 +330,10 @@ def build_top_level_sequence(root, source: bytes, known_functions: set) -> list:
             )
 
             if action["type"] == "source":
+                continue
+
+            if action["type"] == "call":
+                inline_call(action["function"], frozenset())
                 continue
 
             if current_decision is not None:
@@ -428,7 +482,7 @@ def analyze_project(file_paths) -> dict:
     files_out = {}
     for filename, (root, source_bytes) in parsed.items():
        files_out[filename] = {"sources": discover_sources(root, source_bytes),"decision_trees": build_top_level_sequence(
-        root,source_bytes,known_function_names),}
+        root,source_bytes,known_function_names,functions_out),}
     return {"files": files_out, "functions": functions_out}
 
 
