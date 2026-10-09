@@ -103,19 +103,26 @@ def classify_command(node, source: bytes, known_functions: set) -> dict:
 
 def classify_condition(condition_node, source: bytes, known_functions: set) -> dict:
     """Classify an if/elif condition (the node under the `condition` field).
-    If it's a single bare command whose name matches a known function,
-    mark it as a call (this is the `if check_network; then` case).
+    If it's a single bare command (optionally negated with `!`) whose name
+    matches a known function, mark it as a call (this covers both
+    `if check_network; then` and the very common `if ! check_network; then`
+    guard-clause pattern -- negation wraps the command in a
+    negated_command node, so we unwrap it before checking).
     Compound conditions (lists, pipelines, redirected commands, test
     expressions, etc.) are kept as raw text -- they aren't a plain call."""
-    if condition_node.type == "command":
-        name_node = condition_node.child_by_field_name("name")
-        name_text = node_text(name_node, source) if name_node else None
-        text = node_text(condition_node, source)
-        if name_text in known_functions:
-            return {"text": text, "type": "call", "function": name_text}
-        return {"text": text, "type": "raw"}
+    full_text = node_text(condition_node, source)
+    target = condition_node
+    if condition_node.type == "negated_command" and condition_node.named_children:
+        target = condition_node.named_children[0]
 
-    return {"text": node_text(condition_node, source), "type": "raw"}
+    if target.type == "command":
+        name_node = target.child_by_field_name("name")
+        name_text = node_text(name_node, source) if name_node else None
+        if name_text in known_functions:
+            return {"text": full_text, "type": "call", "function": name_text}
+        return {"text": full_text, "type": "raw"}
+
+    return {"text": full_text, "type": "raw"}
 
 
 # ---------------------------------------------------------------------------
@@ -124,61 +131,279 @@ def classify_condition(condition_node, source: bytes, known_functions: set) -> d
 
 COMPOUND_TYPES = (
     "for_statement", "while_statement", "c_style_for_statement",
-    "case_statement", "subshell", "compound_statement", "do_group",
+    "subshell", "compound_statement", "do_group",
 )
 
 
+def build_case_node(case_node, source: bytes, known_functions: set) -> dict:
+    """A case_statement becomes its own decision-node shape (distinct from
+    an if_statement's condition/yes/no): {"case_value":..., "branches":[...]}
+    with one branch per case_item, each holding that pattern's own body
+    (which itself can contain further nested ifs/cases)."""
+    value_node = case_node.child_by_field_name("value")
+    value = classify_condition(value_node, source, known_functions) if value_node else None
+
+    branches = []
+    for item in case_node.named_children:
+        if item.type != "case_item":
+            continue
+        # "value" is a repeated field: production|staging|development) gives
+        # THREE separate pattern nodes, not one. Using child_by_field_name
+        # (singular) here left the 2nd/3rd patterns unmatched, and they were
+        # then incorrectly swept into the body as if they were actions.
+        pattern_nodes = item.children_by_field_name("value")
+        pattern_text = "|".join(node_text(p, source) for p in pattern_nodes) if pattern_nodes else "*"
+        body_nodes = [c for c in item.named_children if c not in pattern_nodes and c.type != "comment"]
+        branches.append({"pattern": pattern_text, "then": build_body(body_nodes, source, known_functions)})
+
+    return {
+        "case_value": value,
+        "line": case_node.start_point[0] + 1,
+        "branches": branches,
+    }
+
+
 def build_body(statement_nodes, source: bytes, known_functions: set) -> dict:
-    """Build the {"actions": [...], "nested_ifs": [...]} shape for a
-    then/elif/else body or a function body."""
+    """Build the {"actions": [...], "nested_ifs": [...], "after_actions": [...]}
+    shape for a then/elif/else body or a function body. "nested_ifs" holds
+    both if_statement and case_statement decision nodes found directly
+    here. Actions are split into "actions" (occurring before the first
+    decision in this body) and "after_actions" (occurring after the last
+    one) -- e.g. a guard-clause chain followed by a final `return 0`. This
+    is an approximation: actions interleaved BETWEEN multiple decisions in
+    the same body all land in "after_actions" too, since we don't track a
+    full per-statement order, only before-vs-after the decision block."""
     actions = []
+    after_actions = []
     nested_ifs = []
+    seen_decision = False
 
     for node in statement_nodes:
+        if node.type == "comment":
+            continue
         if node.type == "if_statement":
             nested_ifs.append(build_if_node(node, source, known_functions))
+            seen_decision = True
+        elif node.type == "case_statement":
+            nested_ifs.append(build_case_node(node, source, known_functions))
+            seen_decision = True
         elif node.type == "command":
             action = classify_command(node, source, known_functions)
             if action["type"] != "source":  # source lines are dependency info, not actions
-                actions.append(action)
+                (after_actions if seen_decision else actions).append(action)
         elif node.type == "function_definition":
             continue  # handled at the project level, not inline
         elif node.type in COMPOUND_TYPES:
-            nested_ifs.extend(find_nested_ifs(node, source, known_functions))
-            actions.append({"type": "block", "text": node_text(node, source)})
+            inner_ifs = find_nested_ifs(node, source, known_functions)
+            nested_ifs.extend(inner_ifs)
+            (after_actions if seen_decision else actions).append({"type": "block", "text": node_text(node, source)})
+            if inner_ifs:
+                seen_decision = True
         else:
             text = node_text(node, source)
             if text:
-                actions.append({"type": "other", "text": text})
+                (after_actions if seen_decision else actions).append({"type": "other", "text": text})
 
-    return {"actions": actions, "nested_ifs": nested_ifs}
+    return {"actions": actions, "nested_ifs": nested_ifs, "after_actions": after_actions}
 
 
 def find_nested_ifs(node, source: bytes, known_functions: set) -> list:
-    """Recursively find if_statements inside for/while/case/subshell bodies,
-    without crossing into a nested function_definition."""
+    """Recursively find if_statement/case_statement decision nodes inside
+    for/while/subshell bodies, without crossing into a nested
+    function_definition."""
     found = []
     for child in node.named_children:
         if child.type == "if_statement":
             found.append(build_if_node(child, source, known_functions))
+        elif child.type == "case_statement":
+            found.append(build_case_node(child, source, known_functions))
         elif child.type == "function_definition":
             continue
         else:
             found.extend(find_nested_ifs(child, source, known_functions))
     return found
 
+def build_top_level_sequence(root, source: bytes, known_functions: set, functions_out: dict = None) -> list:
+    """
+    Build top-level decision trees while preserving statements that
+    occur before, between, and after decisions.
+
+    Leading statements before the first if/case are attached to the
+    first decision as `before_actions`.
+
+    Statements occurring after a decision and before the next decision
+    are attached to that decision as `after_actions`.
+
+    This keeps the existing top-level decision-tree structure while
+    preventing sequential commands from being silently lost.
+
+    A script's real control flow very often isn't a literal if/case
+    sitting at the top of the file at all - the common convention is
+    `main() { ... }` followed by a bare `main "$@"` call, with every
+    if/case living inside that function body instead. Without
+    `functions_out`, such a script has NO if/case at its own top level,
+    so the decision tree comes out completely empty even though the
+    script's actual logic is fully analyzable - it's just one call away.
+    When `functions_out` is provided (the already-built {name: {actions,
+    nested_ifs, after_actions, ...}} map for every function in the
+    project), a bare top-level call to a known function is inlined here
+    exactly as if its body had appeared directly at this point in the
+    script, so its own decisions still populate `result`.
+    """
+    result = []
+
+    leading_actions = []
+    current_decision = None
+
+    def inline_call(fname, visited):
+        nonlocal current_decision, leading_actions
+
+        if functions_out is None or fname not in functions_out or fname in visited:
+            return
+
+        visited = visited | {fname}
+        func = functions_out[fname]
+
+        for action in func.get("actions", []):
+            if action["type"] == "call":
+                inline_call(action["function"], visited)
+                continue
+
+            if current_decision is not None:
+                current_decision.setdefault("after_actions", []).append(action)
+            else:
+                leading_actions.append(action)
+
+        for decision in func.get("nested_ifs", []):
+            if current_decision is None and leading_actions:
+                decision["before_actions"] = leading_actions
+                leading_actions = []
+
+            result.append(decision)
+            current_decision = decision
+
+        for action in func.get("after_actions", []):
+            if action["type"] == "call":
+                inline_call(action["function"], visited)
+                continue
+
+            if current_decision is not None:
+                current_decision.setdefault("after_actions", []).append(action)
+            else:
+                leading_actions.append(action)
+
+    for child in root.named_children:
+        if child.type == "comment":
+            continue
+
+        if child.type in ("if_statement", "case_statement"):
+            if child.type == "if_statement":
+                decision = build_if_node(
+                    child,
+                    source,
+                    known_functions
+                )
+            else:
+                decision = build_case_node(
+                    child,
+                    source,
+                    known_functions
+                )
+
+            # Statements before the first decision belong to the first
+            # decision as "before_actions".
+            if current_decision is None and leading_actions:
+                decision["before_actions"] = leading_actions
+
+            result.append(decision)
+            current_decision = decision
+            continue
+
+        if child.type == "function_definition":
+            continue
+
+        if child.type == "command":
+            action = classify_command(
+                child,
+                source,
+                known_functions
+            )
+
+            if action["type"] == "source":
+                continue
+
+            if action["type"] == "call":
+                inline_call(action["function"], frozenset())
+                continue
+
+            if current_decision is not None:
+                current_decision.setdefault(
+                    "after_actions", []
+                ).append(action)
+            else:
+                leading_actions.append(action)
+
+        elif child.type in COMPOUND_TYPES:
+            text = node_text(child, source)
+
+            if text:
+                action = {
+                    "type": "block",
+                    "text": text
+                }
+
+                if current_decision is not None:
+                    current_decision.setdefault(
+                        "after_actions", []
+                    ).append(action)
+                else:
+                    leading_actions.append(action)
+
+        else:
+            text = node_text(child, source)
+
+            if text:
+                action = {
+                    "type": "other",
+                    "text": text
+                }
+
+                if current_decision is not None:
+                    current_decision.setdefault(
+                        "after_actions", []
+                    ).append(action)
+                else:
+                    leading_actions.append(action)
+
+    return result
 
 def find_top_level_ifs(root, source: bytes, known_functions: set) -> list:
-    """Find if_statements at the top level of a file (outside any function)."""
+    """Find if_statement/case_statement decision nodes at the top level of
+    a file (outside any function)."""
     found = []
     for child in root.named_children:
         if child.type == "if_statement":
             found.append(build_if_node(child, source, known_functions))
+        elif child.type == "case_statement":
+            found.append(build_case_node(child, source, known_functions))
         elif child.type == "function_definition":
             continue
         else:
             found.extend(find_nested_ifs(child, source, known_functions))
     return found
+
+
+def _condition_by_position(node):
+    """Fallback for when child_by_field_name('condition') returns None --
+    find the anonymous 'then' token and take the named child immediately
+    before it. Used because elif_clause doesn't expose 'condition' as a
+    field the way if_statement does."""
+    children = node.children
+    then_idx = next((i for i, c in enumerate(children) if c.type == "then"), None)
+    if then_idx is None:
+        return None
+    named_before = [c for c in children[:then_idx] if c.is_named]
+    return named_before[-1] if named_before else None
 
 
 def build_if_node(if_node, source: bytes, known_functions: set) -> dict:
@@ -186,6 +411,8 @@ def build_if_node(if_node, source: bytes, known_functions: set) -> dict:
     simple commands, redirected commands, lists/pipelines, test
     expressions, etc.) rather than scanning for 'if'/'then' tokens."""
     condition_node = if_node.child_by_field_name("condition")
+    if condition_node is None:
+        condition_node = _condition_by_position(if_node)
     condition = classify_condition(condition_node, source, known_functions) if condition_node else None
 
     then_nodes = []
@@ -214,6 +441,8 @@ def build_if_node(if_node, source: bytes, known_functions: set) -> dict:
 
 def build_elif_node(elif_node, source: bytes, known_functions: set) -> dict:
     condition_node = elif_node.child_by_field_name("condition")
+    if condition_node is None:
+        condition_node = _condition_by_position(elif_node)
     condition = classify_condition(condition_node, source, known_functions) if condition_node else None
     body_nodes = [
         c for c in elif_node.named_children
@@ -252,11 +481,8 @@ def analyze_project(file_paths) -> dict:
 
     files_out = {}
     for filename, (root, source_bytes) in parsed.items():
-        files_out[filename] = {
-            "sources": discover_sources(root, source_bytes),
-            "decision_trees": find_top_level_ifs(root, source_bytes, known_function_names),
-        }
-
+       files_out[filename] = {"sources": discover_sources(root, source_bytes),"decision_trees": build_top_level_sequence(
+        root,source_bytes,known_function_names,functions_out),}
     return {"files": files_out, "functions": functions_out}
 
 
@@ -276,7 +502,7 @@ def main():
     file_paths = []
     for p in args.paths:
         if p.is_dir():
-            file_paths.extend(sorted(p.glob("*.sh")))
+            file_paths.extend(sorted(p.rglob("*.sh")))
         else:
             file_paths.append(p)
 
